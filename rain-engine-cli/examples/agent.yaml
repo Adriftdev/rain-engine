@@ -1,0 +1,47 @@
+runtime:
+  server:
+    bind_address: 127.0.0.1:8081
+    request_timeout_ms: 30000
+    default_policy:
+      max_steps: 16
+      max_execution_time_ms: 30000
+      provider_timeout_ms: 15000
+      max_tool_timeout_ms: 5000
+      max_consecutive_tool_failures: 3
+      cache_threshold_tokens: 16000
+      max_cost_per_session: 5.0
+      max_parallel_skill_calls: 8
+      max_inline_attachment_bytes: 524288
+      allow_native_skills: true
+    allow_policy_overrides: false
+    allow_provider_overrides: false
+    default_provider:
+      model: gemini-1.5-pro
+      temperature: 0.1
+      max_tokens: 1024
+  store:
+    kind: postgres
+    database_url: postgres://postgres:Thief450noscope!@localhost:5432/postgres
+  blob:
+    kind: local_directory
+    path: ./.rain-engine/blobs
+  provider:
+    kind: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    auth_mode: api_key
+    credential: ${GEMINI_API_KEY}
+    model: gemini-1.5-pro
+    temperature: 0.1
+    max_tokens: 1024
+    system_instruction: >
+      You are a customer support automation agent with access to trusted backend tools.
+    provider_name: gemini
+coordination_url: redis://127.0.0.1/
+ingress:
+  url: redis://127.0.0.1/
+  stream: rain-engine.support.events
+  group: support-workers
+  consumer: worker-1
+  block_ms: 5000
+skill_packs:
+  - file://./packs/customer-support.wasm

@@ -1,0 +1,14 @@
+[package]
+name = "rain-engine-store-valkey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+rain-engine-core = { path = "../rain-engine-core" }
+redis.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

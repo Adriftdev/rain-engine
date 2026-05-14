@@ -1,0 +1,31 @@
+[package]
+name = "rain-engine-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+multer.workspace = true
+rain-engine-blob = { path = "../rain-engine-blob" }
+rain-engine-core = { path = "../rain-engine-core" }
+rain-engine-provider-gemini = { path = "../rain-engine-provider-gemini" }
+rain-engine-openai = { path = "../rain-engine-openai" }
+rain-engine-store-pg = { path = "../rain-engine-store-pg" }
+rain-engine-store-sqlite = { path = "../rain-engine-store-sqlite" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rain-engine-macros = { path = "../rain-engine-macros" }
+rain-engine-wasm = { path = "../rain-engine-wasm" }
+schemars.workspace = true
+tower.workspace = true
