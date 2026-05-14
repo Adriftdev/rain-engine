@@ -1,3 +1,6 @@
+//! Command-line entrypoint for validating and running declarative RainEngine
+//! deployments.
+
 use rain_engine_blob::BlobBackendConfig;
 use rain_engine_ingress::ValkeyStreamConfig;
 use rain_engine_runtime::{
@@ -13,10 +16,61 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct AgentFile {
+    #[serde(default)]
+    profile: AgentDeploymentProfile,
     runtime: RuntimeBootstrapConfig,
+    #[serde(default)]
+    retrieval: RetrievalConfig,
     coordination_url: Option<String>,
     ingress: Option<ValkeyStreamConfig>,
+    #[serde(default)]
     skill_packs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AgentDeploymentProfile {
+    agent_id: String,
+    role: String,
+    default_scopes: Vec<String>,
+    allowed_skill_names: Vec<String>,
+    planning_cadence: String,
+    max_active_tasks: usize,
+    wake_policy: String,
+    review_policy: String,
+}
+
+impl Default for AgentDeploymentProfile {
+    fn default() -> Self {
+        Self {
+            agent_id: "rain-agent".to_string(),
+            role: "event automation agent".to_string(),
+            default_scopes: Vec::new(),
+            allowed_skill_names: Vec::new(),
+            planning_cadence: "event".to_string(),
+            max_active_tasks: 4,
+            wake_policy: "external_scheduler".to_string(),
+            review_policy: "approval_scope".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RetrievalConfig {
+    exact_replay: bool,
+    recent_working_set_limit: usize,
+    semantic_limit: usize,
+    graph_hops: usize,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            exact_replay: true,
+            recent_working_set_limit: 32,
+            semantic_limit: 8,
+            graph_hops: 2,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -92,6 +146,21 @@ fn read_agent_file(path: &Path) -> Result<AgentFile, CliError> {
 }
 
 fn validate_agent_file(agent: &AgentFile) -> Result<(), CliError> {
+    if agent.profile.agent_id.trim().is_empty() || agent.profile.role.trim().is_empty() {
+        return Err(CliError::Message(
+            "profile.agent_id and profile.role must not be empty".to_string(),
+        ));
+    }
+    if agent.profile.max_active_tasks == 0 {
+        return Err(CliError::Message(
+            "profile.max_active_tasks must be greater than zero".to_string(),
+        ));
+    }
+    if agent.retrieval.recent_working_set_limit == 0 || agent.retrieval.semantic_limit == 0 {
+        return Err(CliError::Message(
+            "retrieval limits must be greater than zero".to_string(),
+        ));
+    }
     if let StoreBootstrapConfig::Postgres { database_url } = &agent.runtime.store {
         if database_url.trim().is_empty() {
             return Err(CliError::Message(
