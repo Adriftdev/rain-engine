@@ -1,3 +1,8 @@
+//! Valkey-backed coordination and scratchpad storage for RainEngine workers.
+//!
+//! Valkey is used for distributed claims, leases, and short-lived key/value
+//! state. Durable agent state remains in the ledger store.
+
 use async_trait::async_trait;
 use rain_engine_core::{
     CoordinationClaim, CoordinationError, CoordinationStore, InMemoryCoordinationStore,

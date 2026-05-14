@@ -3,6 +3,7 @@ use rain_engine_core::{
     AgentAction, AgentEngine, AgentTrigger, MockLlmProvider, PlannedSkillCall, ProcessRequest,
     SkillExecutor, SkillInvocation, SkillManifestDescriptor,
 };
+use rain_engine_runtime::run_until_terminal;
 use rain_engine_store_sqlite::SqliteMemoryStore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -56,19 +57,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_skill(EchoInput::skill_manifest(), Arc::new(EchoExecutor))
         .await;
 
-    let outcome = engine
-        .process_trigger(
-            ProcessRequest::new(
-                "example-session",
-                AgentTrigger::Message {
-                    user_id: "u1".to_string(),
-                    content: "Run the skill".to_string(),
-                    attachments: Vec::new(),
-                },
-            )
-            .with_scope("tool:run"),
+    let outcome = run_until_terminal(
+        &engine,
+        ProcessRequest::new(
+            "example-session",
+            AgentTrigger::Message {
+                user_id: "u1".to_string(),
+                content: "Run the skill".to_string(),
+                attachments: Vec::new(),
+            },
         )
-        .await?;
+        .with_scope("tool:run"),
+    )
+    .await?;
 
     println!("embedded_sqlite outcome: {:?}", outcome);
     Ok(())

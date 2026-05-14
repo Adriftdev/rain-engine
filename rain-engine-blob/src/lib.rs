@@ -1,3 +1,8 @@
+//! Blob backends for multimodal RainEngine attachments.
+//!
+//! The core only stores attachment references; this crate provides concrete
+//! local and in-memory storage implementations plus config wiring.
+
 use async_trait::async_trait;
 use rain_engine_core::{
     AttachmentRef, BlobDescriptor, BlobStore, BlobStoreError, InMemoryBlobStore, MultimodalPayload,

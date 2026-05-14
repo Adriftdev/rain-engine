@@ -88,6 +88,271 @@ impl CorrelationId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GoalId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArtifactId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObservationId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WakeId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceRef {
+    pub resource_id: String,
+    pub resource_type: String,
+    pub label: String,
+    pub external_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelationshipEdge {
+    pub from_resource_id: String,
+    pub to_resource_id: String,
+    pub relation: String,
+    pub observed_at: SystemTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GoalStatus {
+    Active,
+    Blocked,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskStatus {
+    Pending,
+    Ready,
+    Running,
+    Blocked,
+    WaitingHuman,
+    Done,
+    Failed,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryPolicy {
+    pub max_recent_items: usize,
+    pub semantic_retrieval_limit: usize,
+    pub graph_hops: usize,
+}
+
+impl Default for MemoryPolicy {
+    fn default() -> Self {
+        Self {
+            max_recent_items: 32,
+            semantic_retrieval_limit: 8,
+            graph_hops: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EscalationPolicy {
+    pub require_human_approval_scopes: Vec<String>,
+    pub max_auto_delegations: usize,
+}
+
+impl Default for EscalationPolicy {
+    fn default() -> Self {
+        Self {
+            require_human_approval_scopes: vec!["scope:human_approval".to_string()],
+            max_auto_delegations: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WakePolicy {
+    pub allow_scheduled_wakes: bool,
+    pub default_recheck_ms: u64,
+    pub max_pending_wakes: usize,
+}
+
+impl Default for WakePolicy {
+    fn default() -> Self {
+        Self {
+            allow_scheduled_wakes: true,
+            default_recheck_ms: 30 * 60 * 1000,
+            max_pending_wakes: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewPolicy {
+    pub require_review_for_native_skills: bool,
+    pub require_review_for_delegation: bool,
+    pub reviewer_scopes: Vec<String>,
+}
+
+impl Default for ReviewPolicy {
+    fn default() -> Self {
+        Self {
+            require_review_for_native_skills: false,
+            require_review_for_delegation: true,
+            reviewer_scopes: vec!["scope:human_approval".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentProfile {
+    pub agent_id: AgentId,
+    pub role: String,
+    pub default_scopes: Vec<String>,
+    pub allowed_skill_names: Vec<String>,
+    pub goal_ids: Vec<GoalId>,
+    pub memory_policy: MemoryPolicy,
+    pub wake_policy: WakePolicy,
+    pub review_policy: ReviewPolicy,
+    pub escalation_policy: EscalationPolicy,
+    pub config_artifact: Option<ArtifactId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalRecord {
+    pub goal_id: GoalId,
+    pub created_at: SystemTime,
+    pub title: String,
+    pub detail: Option<String>,
+    pub status: GoalStatus,
+    pub parent_goal_id: Option<GoalId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRecord {
+    pub task_id: TaskId,
+    pub goal_id: Option<GoalId>,
+    pub parent_task_id: Option<TaskId>,
+    pub created_at: SystemTime,
+    pub title: String,
+    pub detail: Option<String>,
+    pub status: TaskStatus,
+    pub assignee: Option<String>,
+    pub blocked_by: Vec<TaskId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservationRecord {
+    pub observation_id: ObservationId,
+    pub recorded_at: SystemTime,
+    pub source: String,
+    pub content: Value,
+    pub attachment_ids: Vec<String>,
+    pub related_resources: Vec<ResourceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArtifactRecord {
+    pub artifact_id: ArtifactId,
+    pub created_at: SystemTime,
+    pub name: String,
+    pub mime_type: String,
+    pub descriptor: Option<BlobDescriptor>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WakeRequestRecord {
+    pub wake_id: WakeId,
+    pub requested_at: SystemTime,
+    pub due_at: SystemTime,
+    pub reason: String,
+    pub task_id: Option<TaskId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentStateSnapshot {
+    pub agent_id: AgentId,
+    pub profile: Option<AgentProfile>,
+    pub goals: Vec<GoalRecord>,
+    pub tasks: Vec<TaskRecord>,
+    pub observations: Vec<ObservationRecord>,
+    pub artifacts: Vec<ArtifactRecord>,
+    pub resources: Vec<ResourceRef>,
+    pub relationships: Vec<RelationshipEdge>,
+    pub pending_wake: Option<WakeRequestRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AgentStateDelta {
+    pub created_goal_ids: Vec<GoalId>,
+    pub updated_task_ids: Vec<TaskId>,
+    pub observation_ids: Vec<ObservationId>,
+    pub artifact_ids: Vec<ArtifactId>,
+    pub delegation_correlation_ids: Vec<CorrelationId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum KernelEvent {
+    GoalCreated(GoalRecord),
+    TaskPlanned(TaskRecord),
+    TaskClaimed {
+        task_id: TaskId,
+        claimed_at: SystemTime,
+        assignee: Option<String>,
+    },
+    TaskBlocked {
+        task_id: TaskId,
+        blocked_at: SystemTime,
+        reason: String,
+    },
+    TaskCompleted {
+        task_id: TaskId,
+        completed_at: SystemTime,
+        artifact_ids: Vec<ArtifactId>,
+    },
+    TaskFailed {
+        task_id: TaskId,
+        failed_at: SystemTime,
+        reason: String,
+    },
+    TaskAbandoned {
+        task_id: TaskId,
+        abandoned_at: SystemTime,
+        reason: String,
+    },
+    HumanInputRequested {
+        task_id: Option<TaskId>,
+        requested_at: SystemTime,
+        prompt: String,
+        resume_token: ResumeToken,
+    },
+    ObservationAppended(ObservationRecord),
+    ArtifactProduced(ArtifactRecord),
+    WakeRequested(WakeRequestRecord),
+    WakeScheduled(WakeRequestRecord),
+    DelegationRequested(DelegationRecord),
+    DelegationResolved {
+        correlation_id: CorrelationId,
+        resolved_at: SystemTime,
+        payload: Value,
+        metadata: Value,
+    },
+    ResourceRegistered(ResourceRef),
+    RelationshipObserved(RelationshipEdge),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KernelEventRecord {
+    pub event_id: String,
+    pub occurred_at: SystemTime,
+    pub event: KernelEvent,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationTarget {
     pub stream: String,
@@ -102,6 +367,26 @@ pub struct DelegationTask {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AgentTrigger {
+    ExternalEvent {
+        source: String,
+        payload: Value,
+        attachments: Vec<AttachmentRef>,
+    },
+    ScheduledWake {
+        wake_id: WakeId,
+        due_at: SystemTime,
+        reason: String,
+    },
+    HumanInput {
+        actor_id: String,
+        content: String,
+        attachments: Vec<AttachmentRef>,
+    },
+    SystemObservation {
+        source: String,
+        observation: Value,
+        attachments: Vec<AttachmentRef>,
+    },
     Webhook {
         source: String,
         payload: Value,
@@ -136,11 +421,16 @@ pub enum AgentTrigger {
 impl AgentTrigger {
     pub fn attachments(&self) -> &[AttachmentRef] {
         match self {
-            AgentTrigger::Webhook { attachments, .. }
+            AgentTrigger::ExternalEvent { attachments, .. }
+            | AgentTrigger::HumanInput { attachments, .. }
+            | AgentTrigger::SystemObservation { attachments, .. }
+            | AgentTrigger::Webhook { attachments, .. }
             | AgentTrigger::RuleTrigger { attachments, .. }
             | AgentTrigger::ProactiveHeartbeat { attachments, .. }
             | AgentTrigger::Message { attachments, .. } => attachments,
-            AgentTrigger::Approval { .. } | AgentTrigger::DelegationResult { .. } => &[],
+            AgentTrigger::ScheduledWake { .. }
+            | AgentTrigger::Approval { .. }
+            | AgentTrigger::DelegationResult { .. } => &[],
         }
     }
 }
@@ -393,6 +683,7 @@ pub struct OutcomeRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SessionRecord {
     Trigger(TriggerRecord),
+    KernelEvent(KernelEventRecord),
     ModelDecision(ModelDecisionRecord),
     ToolCall(ToolCallRecord),
     ToolResult(ToolResultRecord),
@@ -409,6 +700,7 @@ pub enum SessionRecord {
 #[serde(rename_all = "snake_case")]
 pub enum SessionRecordKind {
     Trigger,
+    KernelEvent,
     ModelDecision,
     ToolCall,
     ToolResult,
@@ -425,6 +717,7 @@ impl SessionRecordKind {
     pub fn as_str(self) -> &'static str {
         match self {
             SessionRecordKind::Trigger => "trigger",
+            SessionRecordKind::KernelEvent => "kernel_event",
             SessionRecordKind::ModelDecision => "model_decision",
             SessionRecordKind::ToolCall => "tool_call",
             SessionRecordKind::ToolResult => "tool_result",
@@ -441,6 +734,7 @@ impl SessionRecordKind {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "trigger" => Some(SessionRecordKind::Trigger),
+            "kernel_event" => Some(SessionRecordKind::KernelEvent),
             "model_decision" => Some(SessionRecordKind::ModelDecision),
             "tool_call" => Some(SessionRecordKind::ToolCall),
             "tool_result" => Some(SessionRecordKind::ToolResult),
@@ -460,6 +754,7 @@ impl SessionRecord {
     pub fn kind(&self) -> SessionRecordKind {
         match self {
             SessionRecord::Trigger(_) => SessionRecordKind::Trigger,
+            SessionRecord::KernelEvent(_) => SessionRecordKind::KernelEvent,
             SessionRecord::ModelDecision(_) => SessionRecordKind::ModelDecision,
             SessionRecord::ToolCall(_) => SessionRecordKind::ToolCall,
             SessionRecord::ToolResult(_) => SessionRecordKind::ToolResult,
@@ -476,6 +771,7 @@ impl SessionRecord {
     pub fn occurred_at(&self) -> SystemTime {
         match self {
             SessionRecord::Trigger(record) => record.recorded_at,
+            SessionRecord::KernelEvent(record) => record.occurred_at,
             SessionRecord::ModelDecision(record) => record.decided_at,
             SessionRecord::ToolCall(record) => record.called_at,
             SessionRecord::ToolResult(record) => record.finished_at,
@@ -554,6 +850,16 @@ pub struct SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    pub fn kernel_events(&self) -> Vec<KernelEventRecord> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::KernelEvent(event) => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn tool_results(&self) -> Vec<ToolResultRecord> {
         self.records
             .iter()
@@ -581,6 +887,192 @@ impl SessionSnapshot {
             }
             _ => None,
         })
+    }
+
+    pub fn active_trigger(&self) -> Option<TriggerRecord> {
+        let outcome_index = self
+            .records
+            .iter()
+            .rposition(|record| matches!(record, SessionRecord::Outcome(_)));
+        let slice = match outcome_index {
+            Some(index) => &self.records[index + 1..],
+            None => &self.records[..],
+        };
+        slice.iter().find_map(|record| match record {
+            SessionRecord::Trigger(trigger) => Some(trigger.clone()),
+            _ => None,
+        })
+    }
+
+    pub fn current_step_count(&self) -> usize {
+        let outcome_index = self
+            .records
+            .iter()
+            .rposition(|record| matches!(record, SessionRecord::Outcome(_)));
+        let slice = match outcome_index {
+            Some(index) => &self.records[index + 1..],
+            None => &self.records[..],
+        };
+        slice
+            .iter()
+            .filter(|record| matches!(record, SessionRecord::ModelDecision(_)))
+            .count()
+    }
+
+    pub fn current_consecutive_tool_failure_steps(&self) -> usize {
+        let outcome_index = self
+            .records
+            .iter()
+            .rposition(|record| matches!(record, SessionRecord::Outcome(_)));
+        let slice = match outcome_index {
+            Some(index) => &self.records[index + 1..],
+            None => &self.records[..],
+        };
+
+        let mut windows = Vec::<(AgentAction, Vec<ToolResultRecord>)>::new();
+        let mut current_action: Option<AgentAction> = None;
+        let mut current_results = Vec::<ToolResultRecord>::new();
+
+        for record in slice {
+            match record {
+                SessionRecord::ModelDecision(decision) => {
+                    if let Some(action) = current_action.replace(decision.action.clone()) {
+                        windows.push((action, current_results));
+                        current_results = Vec::new();
+                    }
+                }
+                SessionRecord::ToolResult(result) => current_results.push(result.clone()),
+                _ => {}
+            }
+        }
+
+        if let Some(action) = current_action {
+            windows.push((action, current_results));
+        }
+
+        let mut trailing_failures = 0usize;
+        for (action, results) in windows.into_iter().rev() {
+            match action {
+                AgentAction::CallSkills(calls)
+                    if !calls.is_empty()
+                        && results.len() == calls.len()
+                        && results.iter().all(|result| result.output.is_err()) =>
+                {
+                    trailing_failures += 1;
+                }
+                _ => break,
+            }
+        }
+
+        trailing_failures
+    }
+
+    pub fn agent_state(&self) -> AgentStateSnapshot {
+        let mut goals = Vec::<GoalRecord>::new();
+        let mut tasks = Vec::<TaskRecord>::new();
+        let mut observations = Vec::<ObservationRecord>::new();
+        let mut artifacts = Vec::<ArtifactRecord>::new();
+        let mut resources = Vec::<ResourceRef>::new();
+        let mut relationships = Vec::<RelationshipEdge>::new();
+        let mut pending_wake = None;
+
+        for event_record in self.kernel_events() {
+            match event_record.event {
+                KernelEvent::GoalCreated(goal) => {
+                    upsert_by_key(&mut goals, goal, |goal| goal.goal_id.clone())
+                }
+                KernelEvent::TaskPlanned(task) => {
+                    upsert_by_key(&mut tasks, task, |task| task.task_id.clone())
+                }
+                KernelEvent::TaskClaimed {
+                    task_id,
+                    claimed_at: _,
+                    assignee,
+                } => {
+                    if let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id) {
+                        task.status = TaskStatus::Running;
+                        task.assignee = assignee;
+                    }
+                }
+                KernelEvent::TaskBlocked { task_id, .. } => {
+                    if let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id) {
+                        task.status = TaskStatus::Blocked;
+                    }
+                }
+                KernelEvent::TaskCompleted { task_id, .. } => {
+                    if let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id) {
+                        task.status = TaskStatus::Done;
+                    }
+                }
+                KernelEvent::TaskFailed { task_id, .. } => {
+                    if let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id) {
+                        task.status = TaskStatus::Failed;
+                    }
+                }
+                KernelEvent::TaskAbandoned { task_id, .. } => {
+                    if let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id) {
+                        task.status = TaskStatus::Abandoned;
+                    }
+                }
+                KernelEvent::HumanInputRequested { task_id, .. } => {
+                    if let Some(task_id) = task_id {
+                        if let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id) {
+                            task.status = TaskStatus::WaitingHuman;
+                        }
+                    }
+                }
+                KernelEvent::ObservationAppended(observation) => observations.push(observation),
+                KernelEvent::ArtifactProduced(artifact) => {
+                    upsert_by_key(&mut artifacts, artifact, |artifact| {
+                        artifact.artifact_id.clone()
+                    })
+                }
+                KernelEvent::WakeRequested(wake) | KernelEvent::WakeScheduled(wake) => {
+                    pending_wake = Some(wake)
+                }
+                KernelEvent::DelegationRequested(record) => {
+                    let resource = ResourceRef {
+                        resource_id: record.correlation_id.0.clone(),
+                        resource_type: "delegation".to_string(),
+                        label: record.task.task_type.clone(),
+                        external_ref: Some(record.target.stream.clone()),
+                    };
+                    upsert_by_key(&mut resources, resource, |resource| {
+                        resource.resource_id.clone()
+                    });
+                }
+                KernelEvent::DelegationResolved { .. } => {}
+                KernelEvent::ResourceRegistered(resource) => {
+                    upsert_by_key(&mut resources, resource, |resource| {
+                        resource.resource_id.clone()
+                    })
+                }
+                KernelEvent::RelationshipObserved(edge) => relationships.push(edge),
+            }
+        }
+
+        AgentStateSnapshot {
+            agent_id: AgentId(self.session_id.clone()),
+            profile: Some(AgentProfile {
+                agent_id: AgentId(self.session_id.clone()),
+                role: "event-agent".to_string(),
+                default_scopes: Vec::new(),
+                allowed_skill_names: Vec::new(),
+                goal_ids: goals.iter().map(|goal| goal.goal_id.clone()).collect(),
+                memory_policy: MemoryPolicy::default(),
+                wake_policy: WakePolicy::default(),
+                review_policy: ReviewPolicy::default(),
+                escalation_policy: EscalationPolicy::default(),
+                config_artifact: None,
+            }),
+            goals,
+            tasks,
+            observations,
+            artifacts,
+            resources,
+            relationships,
+            pending_wake,
+        }
     }
 }
 
@@ -732,6 +1224,12 @@ pub struct AgentContext {
 
 impl AgentContext {
     pub fn to_snapshot(&self, current_step: usize) -> AgentContextSnapshot {
+        let snapshot = SessionSnapshot {
+            session_id: self.session_id.clone(),
+            records: self.records.clone(),
+            last_sequence_no: None,
+            latest_outcome: None,
+        };
         AgentContextSnapshot {
             session_id: self.session_id.clone(),
             granted_scopes: self.granted_scopes.iter().cloned().collect(),
@@ -749,6 +1247,7 @@ impl AgentContext {
                     _ => None,
                 })
                 .sum(),
+            state: snapshot.agent_state(),
         }
     }
 }
@@ -764,6 +1263,7 @@ pub struct AgentContextSnapshot {
     pub history: Vec<SessionRecord>,
     pub prior_tool_results: Vec<ToolResultRecord>,
     pub session_cost_usd: f64,
+    pub state: AgentStateSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -809,6 +1309,51 @@ impl ProcessRequest {
         self.provider.model = Some(model.into());
         self
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ContinueRequest {
+    pub session_id: String,
+    pub granted_scopes: BTreeSet<String>,
+    pub policy: EnginePolicy,
+    pub provider: ProviderRequestConfig,
+    pub cancellation: CancellationToken,
+}
+
+impl ContinueRequest {
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            granted_scopes: BTreeSet::new(),
+            policy: EnginePolicy::default(),
+            provider: ProviderRequestConfig::default(),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.granted_scopes.insert(scope.into());
+        self
+    }
+
+    pub fn with_policy(mut self, policy: EnginePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AdvanceRequest {
+    Trigger(ProcessRequest),
+    Continue(ContinueRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdvanceResult {
+    pub outcome: Option<EngineOutcome>,
+    pub emitted_events: Vec<KernelEventRecord>,
+    pub state_delta: AgentStateDelta,
+    pub wake_request: Option<WakeRequestRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -866,4 +1411,17 @@ pub fn unix_time_ms(value: SystemTime) -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn upsert_by_key<T, K, F>(items: &mut Vec<T>, value: T, key_fn: F)
+where
+    K: PartialEq,
+    F: Fn(&T) -> K,
+{
+    let key = key_fn(&value);
+    if let Some(existing) = items.iter_mut().find(|item| key_fn(item) == key) {
+        *existing = value;
+    } else {
+        items.push(value);
+    }
 }

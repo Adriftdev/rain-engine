@@ -1,5 +1,5 @@
 [package]
-name = "rain-engine-store-postgres"
+name = "rain-engine-cognition"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,6 @@ license.workspace = true
 async-trait.workspace = true
 rain-engine-core = { path = "../rain-engine-core" }
 serde_json.workspace = true
-sqlx.workspace = true
-thiserror.workspace = true
+
+[dev-dependencies]
 tokio.workspace = true

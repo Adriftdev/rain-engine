@@ -2,9 +2,11 @@
 members = [
     "rain-engine-blob",
     "rain-engine-cli",
+    "rain-engine-cognition",
     "rain-engine-core",
     "rain-engine-ingress",
     "rain-engine-macros",
+    "rain-engine-memory",
     "rain-engine-provider-gemini",
     "rain-engine-openai",
     "rain-engine-wasm",

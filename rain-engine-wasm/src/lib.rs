@@ -1,3 +1,8 @@
+//! Wasmtime-backed executor for untrusted RainEngine skills.
+//!
+//! WASM skills receive explicit JSON inputs and only the host capabilities
+//! declared in their manifest.
+
 use async_trait::async_trait;
 use rain_engine_core::{
     SkillCapability, SkillExecutionError, SkillExecutor, SkillFailureKind, SkillInvocation,
@@ -639,7 +644,7 @@ fn classify_trap(message: String) -> SkillExecutionError {
 mod tests {
     use super::*;
     use axum::{Json, Router, routing::get};
-    use rain_engine_core::{AgentContextSnapshot, ResourcePolicy};
+    use rain_engine_core::{AgentContextSnapshot, AgentId, AgentStateSnapshot, ResourcePolicy};
     use serde_json::json;
 
     fn manifest(timeout_ms: u64, max_memory_bytes: usize) -> SkillManifest {
@@ -673,6 +678,17 @@ mod tests {
                 history: Vec::new(),
                 prior_tool_results: Vec::new(),
                 session_cost_usd: 0.0,
+                state: AgentStateSnapshot {
+                    agent_id: AgentId("session".to_string()),
+                    profile: None,
+                    goals: Vec::new(),
+                    tasks: Vec::new(),
+                    observations: Vec::new(),
+                    artifacts: Vec::new(),
+                    resources: Vec::new(),
+                    relationships: Vec::new(),
+                    pending_wake: None,
+                },
             },
         }
     }

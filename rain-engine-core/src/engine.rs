@@ -1,11 +1,12 @@
 use crate::{
-    AgentAction, AgentContext, AgentTrigger, ApprovalDecision, ApprovalResolutionRecord,
-    DelegationRecord, EngineOutcome, ExecutionMetadata, LlmProvider, MemoryError, MemoryStore,
+    AdvanceRequest, AdvanceResult, AgentAction, AgentContext, AgentStateDelta, AgentTrigger,
+    ApprovalDecision, ApprovalResolutionRecord, ContinueRequest, DelegationRecord, EngineOutcome,
+    ExecutionMetadata, KernelEvent, KernelEventRecord, LlmProvider, MemoryError, MemoryStore,
     MemoryStoreExt, ModelDecisionRecord, OutcomeRecord, PendingApprovalRecord, PlannedSkillCall,
     ProcessRequest, ProviderContentPart, ProviderDecision, ProviderMessage, ProviderRequest,
     ProviderRole, ResumeToken, SessionRecord, SkillBackendKind, SkillDefinition, SkillFailure,
     SkillFailureKind, SkillInvocation, SkillManifest, StopReason, SuspendReason, ToolCallRecord,
-    ToolResultRecord, TriggerRecord,
+    ToolResultRecord, TriggerRecord, WakeRequestRecord,
 };
 use async_trait::async_trait;
 use metrics::{counter, histogram};
@@ -132,8 +133,11 @@ impl AgentEngine {
         }
     }
 
-    pub async fn advance(&self, request: ProcessRequest) -> Result<EngineOutcome, EngineError> {
-        self.process_trigger(request).await
+    pub async fn advance(&self, request: AdvanceRequest) -> Result<AdvanceResult, EngineError> {
+        match request {
+            AdvanceRequest::Trigger(request) => self.advance_trigger(request).await,
+            AdvanceRequest::Continue(request) => self.advance_continue(request).await,
+        }
     }
 
     pub async fn register_skill(&self, manifest: SkillManifest, executor: Arc<dyn SkillExecutor>) {
@@ -168,10 +172,7 @@ impl AgentEngine {
         );
     }
 
-    pub async fn process_trigger(
-        &self,
-        request: ProcessRequest,
-    ) -> Result<EngineOutcome, EngineError> {
+    async fn advance_trigger(&self, request: ProcessRequest) -> Result<AdvanceResult, EngineError> {
         let started_at = SystemTime::now();
         let trigger_id = Uuid::new_v4().to_string();
         let deadline = Instant::now() + request.policy.max_execution_time();
@@ -184,7 +185,12 @@ impl AgentEngine {
             {
                 prior_outcome.idempotent_replay = true;
                 counter!("rain_engine.idempotent_replay_total").increment(1);
-                return Ok(prior_outcome);
+                return Ok(AdvanceResult {
+                    outcome: Some(prior_outcome),
+                    emitted_events: Vec::new(),
+                    state_delta: AgentStateDelta::default(),
+                    wake_request: None,
+                });
             }
         }
 
@@ -196,12 +202,24 @@ impl AgentEngine {
             trigger: request.trigger.clone(),
         };
         if let Err(err) = self.memory.append_trigger(trigger_record).await {
-            return Ok(storage_failure_outcome(trigger_id, 0, err.message));
+            return Ok(AdvanceResult {
+                outcome: Some(storage_failure_outcome(trigger_id, 0, err.message)),
+                emitted_events: Vec::new(),
+                state_delta: AgentStateDelta::default(),
+                wake_request: None,
+            });
         }
 
         let snapshot = match self.memory.load_session(&request.session_id).await {
             Ok(snapshot) => snapshot,
-            Err(err) => return Ok(storage_failure_outcome(trigger_id, 0, err.message)),
+            Err(err) => {
+                return Ok(AdvanceResult {
+                    outcome: Some(storage_failure_outcome(trigger_id, 0, err.message)),
+                    emitted_events: Vec::new(),
+                    state_delta: AgentStateDelta::default(),
+                    wake_request: None,
+                });
+            }
         };
         let mut context = AgentContext {
             session_id: request.session_id.clone(),
@@ -222,8 +240,13 @@ impl AgentEngine {
         counter!("rain_engine.triggers_total").increment(1);
         info!(session_id = %context.session_id, trigger_id = %trigger_id, "processing trigger");
 
-        let mut steps_executed = 0usize;
-        let mut consecutive_tool_failure_steps = 0usize;
+        let emitted_events =
+            derive_trigger_kernel_events(&context.metadata.trigger_id, &request.trigger);
+        self.persist_kernel_events(&mut context, &emitted_events)
+            .await?;
+
+        let mut steps_executed = snapshot.current_step_count();
+        let mut consecutive_tool_failure_steps = snapshot.current_consecutive_tool_failure_steps();
 
         if let AgentTrigger::Approval {
             resume_token,
@@ -238,7 +261,7 @@ impl AgentEngine {
             {
                 Some(pending) => pending,
                 None => {
-                    return self
+                    let outcome = self
                         .finish(
                             &mut context,
                             StopReason::PolicyAborted,
@@ -247,7 +270,8 @@ impl AgentEngine {
                             0,
                             None,
                         )
-                        .await;
+                        .await?;
+                    return Ok(build_advance_result(outcome, emitted_events));
                 }
             };
 
@@ -275,7 +299,7 @@ impl AgentEngine {
                 {
                     BatchExecution::Executed(batch) => batch,
                     BatchExecution::Suspended { .. } => {
-                        return self
+                        let outcome = self
                             .finish(
                                 &mut context,
                                 StopReason::PolicyAborted,
@@ -284,7 +308,8 @@ impl AgentEngine {
                                 pending.step,
                                 None,
                             )
-                            .await;
+                            .await?;
+                        return Ok(build_advance_result(outcome, emitted_events));
                     }
                 },
                 ApprovalDecision::Rejected => ExecutedBatch {
@@ -314,204 +339,283 @@ impl AgentEngine {
             }
             steps_executed = pending.step + 1;
             if resumed.all_failed {
-                consecutive_tool_failure_steps = 1;
+                consecutive_tool_failure_steps += 1;
             }
         }
 
-        loop {
-            if context.metadata.cancellation.is_cancelled() {
-                return self
-                    .finish(
-                        &mut context,
-                        StopReason::Cancelled,
-                        None,
-                        Some("execution cancelled".to_string()),
-                        steps_executed,
-                        None,
-                    )
-                    .await;
+        self.perform_single_step(
+            context,
+            request.trigger,
+            steps_executed,
+            consecutive_tool_failure_steps,
+            emitted_events,
+        )
+        .await
+    }
+
+    async fn advance_continue(
+        &self,
+        request: ContinueRequest,
+    ) -> Result<AdvanceResult, EngineError> {
+        let snapshot = match self.memory.load_session(&request.session_id).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return Ok(AdvanceResult {
+                    outcome: Some(storage_failure_outcome(
+                        request.session_id.clone(),
+                        0,
+                        err.message,
+                    )),
+                    emitted_events: Vec::new(),
+                    state_delta: AgentStateDelta::default(),
+                    wake_request: None,
+                });
             }
+        };
 
-            if Instant::now() >= context.metadata.deadline {
-                return self
-                    .finish(
-                        &mut context,
-                        StopReason::DeadlineExceeded,
-                        None,
-                        Some("engine execution deadline exceeded".to_string()),
-                        steps_executed,
-                        None,
-                    )
-                    .await;
-            }
+        let Some(active_trigger) = snapshot.active_trigger() else {
+            return Ok(AdvanceResult {
+                outcome: Some(EngineOutcome {
+                    trigger_id: Uuid::new_v4().to_string(),
+                    stop_reason: StopReason::Yielded,
+                    response: None,
+                    detail: Some("no active trigger to continue".to_string()),
+                    steps_executed: 0,
+                    idempotent_replay: false,
+                    resume_token: None,
+                }),
+                emitted_events: Vec::new(),
+                state_delta: AgentStateDelta::default(),
+                wake_request: None,
+            });
+        };
 
-            if steps_executed >= context.metadata.policy.max_steps {
-                return self
-                    .finish(
-                        &mut context,
-                        StopReason::MaxStepsReached,
-                        None,
-                        Some("max steps reached".to_string()),
-                        steps_executed,
-                        None,
-                    )
-                    .await;
-            }
+        let trigger_id = active_trigger.trigger_id.clone();
+        let started_at = SystemTime::now();
+        let deadline = Instant::now() + request.policy.max_execution_time();
+        let context = AgentContext {
+            session_id: request.session_id.clone(),
+            records: snapshot.records.clone(),
+            prior_tool_results: snapshot.tool_results(),
+            granted_scopes: request.granted_scopes.clone(),
+            metadata: ExecutionMetadata {
+                trigger_id,
+                idempotency_key: active_trigger.idempotency_key.clone(),
+                started_at,
+                deadline,
+                policy: request.policy.clone(),
+                provider: request.provider.clone(),
+                cancellation: request.cancellation.clone(),
+            },
+        };
 
-            if consecutive_tool_failure_steps
-                >= context.metadata.policy.max_consecutive_tool_failures
-            {
-                return self
-                    .finish(
-                        &mut context,
-                        StopReason::PolicyAborted,
-                        None,
-                        Some("max consecutive tool failure steps reached".to_string()),
-                        steps_executed,
-                        None,
-                    )
-                    .await;
-            }
+        self.perform_single_step(
+            context,
+            active_trigger.trigger,
+            snapshot.current_step_count(),
+            snapshot.current_consecutive_tool_failure_steps(),
+            Vec::new(),
+        )
+        .await
+    }
 
-            let cost_so_far = context
-                .records
-                .iter()
-                .filter_map(|record| match record {
-                    SessionRecord::ProviderUsage(usage) => Some(usage.estimated_cost_usd),
-                    _ => None,
-                })
-                .sum::<f64>();
-            if cost_so_far >= context.metadata.policy.max_cost_per_session {
-                return self
-                    .finish(
-                        &mut context,
-                        StopReason::PolicyAborted,
-                        None,
-                        Some("session cost limit reached".to_string()),
-                        steps_executed,
-                        None,
-                    )
-                    .await;
-            }
+    async fn perform_single_step(
+        &self,
+        mut context: AgentContext,
+        trigger: AgentTrigger,
+        steps_executed: usize,
+        consecutive_tool_failure_steps: usize,
+        mut emitted_events: Vec<KernelEventRecord>,
+    ) -> Result<AdvanceResult, EngineError> {
+        if let Some(outcome) = self
+            .policy_outcome(&mut context, steps_executed, consecutive_tool_failure_steps)
+            .await?
+        {
+            return Ok(build_advance_result(outcome, emitted_events));
+        }
 
-            let available_skills = self
-                .skills
-                .read()
-                .await
-                .values()
-                .filter(|skill| {
-                    skill
-                        .manifest
-                        .required_scopes
-                        .iter()
-                        .all(|scope| context.granted_scopes.contains(scope))
-                })
-                .map(RegisteredSkill::definition)
-                .collect::<Vec<_>>();
-
-            let provider_request = ProviderRequest {
-                trigger: request.trigger.clone(),
-                context: context.to_snapshot(steps_executed),
-                available_skills,
-                config: context.metadata.provider.clone(),
-                policy: context.metadata.policy.clone(),
-                contents: build_provider_contents(&request.trigger),
-            };
-            let provider_started = Instant::now();
-            let decision = match tokio::time::timeout(
-                context.metadata.policy.provider_timeout(),
-                self.llm.generate_action(provider_request),
-            )
+        let available_skills = self
+            .skills
+            .read()
             .await
-            {
-                Ok(Ok(decision)) => decision,
-                Ok(Err(err)) => {
-                    warn!(session_id = %context.session_id, "provider failed: {}", err.message);
-                    return self
-                        .finish(
-                            &mut context,
-                            StopReason::ProviderFailure,
-                            None,
-                            Some(format!("provider failure: {}", err.message)),
-                            steps_executed,
-                            None,
-                        )
-                        .await;
-                }
-                Err(_) => {
-                    warn!(session_id = %context.session_id, "provider timed out");
-                    return self
-                        .finish(
-                            &mut context,
-                            StopReason::ProviderFailure,
-                            None,
-                            Some("provider timeout exceeded".to_string()),
-                            steps_executed,
-                            None,
-                        )
-                        .await;
-                }
-            };
-            histogram!("rain_engine.provider_latency_seconds")
-                .record(provider_started.elapsed().as_secs_f64());
+            .values()
+            .filter(|skill| {
+                skill
+                    .manifest
+                    .required_scopes
+                    .iter()
+                    .all(|scope| context.granted_scopes.contains(scope))
+            })
+            .map(RegisteredSkill::definition)
+            .collect::<Vec<_>>();
 
-            self.persist_provider_metadata(&mut context, &decision)
-                .await?;
+        let provider_request = ProviderRequest {
+            trigger: trigger.clone(),
+            context: context.to_snapshot(steps_executed),
+            available_skills,
+            config: context.metadata.provider.clone(),
+            policy: context.metadata.policy.clone(),
+            contents: build_provider_contents(&trigger),
+        };
+        let provider_started = Instant::now();
+        let decision = match tokio::time::timeout(
+            context.metadata.policy.provider_timeout(),
+            self.llm.generate_action(provider_request),
+        )
+        .await
+        {
+            Ok(Ok(decision)) => decision,
+            Ok(Err(err)) => {
+                warn!(session_id = %context.session_id, "provider failed: {}", err.message);
+                let outcome = self
+                    .finish(
+                        &mut context,
+                        StopReason::ProviderFailure,
+                        None,
+                        Some(format!("provider failure: {}", err.message)),
+                        steps_executed,
+                        None,
+                    )
+                    .await?;
+                return Ok(build_advance_result(outcome, emitted_events));
+            }
+            Err(_) => {
+                warn!(session_id = %context.session_id, "provider timed out");
+                let outcome = self
+                    .finish(
+                        &mut context,
+                        StopReason::ProviderFailure,
+                        None,
+                        Some("provider timeout exceeded".to_string()),
+                        steps_executed,
+                        None,
+                    )
+                    .await?;
+                return Ok(build_advance_result(outcome, emitted_events));
+            }
+        };
+        histogram!("rain_engine.provider_latency_seconds")
+            .record(provider_started.elapsed().as_secs_f64());
 
-            let decision_record = ModelDecisionRecord {
-                step: steps_executed,
-                decided_at: SystemTime::now(),
-                action: decision.action.clone(),
-            };
-            if let Err(err) = self
-                .memory
-                .append_model_decision(&context.session_id, decision_record.clone())
-                .await
-            {
-                return Ok(storage_failure_outcome(
+        self.persist_provider_metadata(&mut context, &decision)
+            .await?;
+
+        let decision_record = ModelDecisionRecord {
+            step: steps_executed,
+            decided_at: SystemTime::now(),
+            action: decision.action.clone(),
+        };
+        if let Err(err) = self
+            .memory
+            .append_model_decision(&context.session_id, decision_record.clone())
+            .await
+        {
+            return Ok(AdvanceResult {
+                outcome: Some(storage_failure_outcome(
                     context.metadata.trigger_id.clone(),
                     steps_executed,
                     err.message,
-                ));
-            }
-            context
-                .records
-                .push(SessionRecord::ModelDecision(decision_record));
+                )),
+                emitted_events,
+                state_delta: AgentStateDelta::default(),
+                wake_request: None,
+            });
+        }
+        context
+            .records
+            .push(SessionRecord::ModelDecision(decision_record));
 
-            match decision.action {
-                AgentAction::Respond { content } => {
-                    return self
-                        .finish(
-                            &mut context,
-                            StopReason::Responded,
-                            Some(content),
-                            None,
-                            steps_executed + 1,
-                            None,
-                        )
-                        .await;
+        match decision.action {
+            AgentAction::Respond { content } => {
+                let outcome = self
+                    .finish(
+                        &mut context,
+                        StopReason::Responded,
+                        Some(content),
+                        None,
+                        steps_executed + 1,
+                        None,
+                    )
+                    .await?;
+                Ok(build_advance_result(outcome, emitted_events))
+            }
+            AgentAction::Yield { reason } => {
+                let outcome = self
+                    .finish(
+                        &mut context,
+                        StopReason::Yielded,
+                        None,
+                        reason,
+                        steps_executed + 1,
+                        None,
+                    )
+                    .await?;
+                Ok(build_advance_result(outcome, emitted_events))
+            }
+            AgentAction::Continue { .. } => Ok(AdvanceResult {
+                outcome: None,
+                emitted_events: emitted_events.clone(),
+                state_delta: derive_state_delta(&emitted_events),
+                wake_request: emitted_events.iter().find_map(extract_wake_request),
+            }),
+            AgentAction::Suspend {
+                reason,
+                pending_calls,
+                resume_token,
+            } => {
+                let outcome = self
+                    .suspend(
+                        &mut context,
+                        steps_executed,
+                        reason,
+                        pending_calls,
+                        resume_token,
+                    )
+                    .await?;
+                Ok(build_advance_result(outcome, emitted_events))
+            }
+            AgentAction::CallSkills(calls) => match self
+                .execute_planned_calls(&context, steps_executed, calls, false)
+                .await?
+            {
+                BatchExecution::Executed(ExecutedBatch {
+                    results,
+                    all_failed,
+                }) => {
+                    for result in results {
+                        if let Err(err) = self
+                            .memory
+                            .append_tool_result(&context.session_id, result.clone())
+                            .await
+                        {
+                            return Ok(AdvanceResult {
+                                outcome: Some(storage_failure_outcome(
+                                    context.metadata.trigger_id.clone(),
+                                    steps_executed + 1,
+                                    err.message,
+                                )),
+                                emitted_events,
+                                state_delta: AgentStateDelta::default(),
+                                wake_request: None,
+                            });
+                        }
+                        context.prior_tool_results.push(result.clone());
+                        context.records.push(SessionRecord::ToolResult(result));
+                    }
+                    let _ = all_failed;
+                    Ok(AdvanceResult {
+                        outcome: None,
+                        emitted_events: emitted_events.clone(),
+                        state_delta: derive_state_delta(&emitted_events),
+                        wake_request: emitted_events.iter().find_map(extract_wake_request),
+                    })
                 }
-                AgentAction::Yield { reason } => {
-                    return self
-                        .finish(
-                            &mut context,
-                            StopReason::Yielded,
-                            None,
-                            reason,
-                            steps_executed + 1,
-                            None,
-                        )
-                        .await;
-                }
-                AgentAction::Continue { .. } => {
-                    steps_executed += 1;
-                }
-                AgentAction::Suspend {
+                BatchExecution::Suspended {
                     reason,
                     pending_calls,
                     resume_token,
                 } => {
-                    return self
+                    let outcome = self
                         .suspend(
                             &mut context,
                             steps_executed,
@@ -519,87 +623,158 @@ impl AgentEngine {
                             pending_calls,
                             resume_token,
                         )
-                        .await;
+                        .await?;
+                    Ok(build_advance_result(outcome, emitted_events))
                 }
-                AgentAction::CallSkills(calls) => {
-                    steps_executed += 1;
-                    match self
-                        .execute_planned_calls(&context, steps_executed - 1, calls, false)
-                        .await?
-                    {
-                        BatchExecution::Executed(ExecutedBatch {
-                            results,
-                            all_failed,
-                        }) => {
-                            for result in results {
-                                if let Err(err) = self
-                                    .memory
-                                    .append_tool_result(&context.session_id, result.clone())
-                                    .await
-                                {
-                                    return Ok(storage_failure_outcome(
-                                        context.metadata.trigger_id.clone(),
-                                        steps_executed,
-                                        err.message,
-                                    ));
-                                }
-                                context.prior_tool_results.push(result.clone());
-                                context.records.push(SessionRecord::ToolResult(result));
-                            }
-                            consecutive_tool_failure_steps = if all_failed {
-                                consecutive_tool_failure_steps + 1
-                            } else {
-                                0
-                            };
-                        }
-                        BatchExecution::Suspended {
-                            reason,
-                            pending_calls,
-                            resume_token,
-                        } => {
-                            return self
-                                .suspend(
-                                    &mut context,
-                                    steps_executed - 1,
-                                    reason,
-                                    pending_calls,
-                                    resume_token,
-                                )
-                                .await;
-                        }
-                    }
-                }
-                AgentAction::Delegate {
+            },
+            AgentAction::Delegate {
+                target,
+                task,
+                correlation_id,
+                resume_token,
+            } => {
+                let record = DelegationRecord {
+                    correlation_id,
+                    created_at: SystemTime::now(),
+                    trigger_id: context.metadata.trigger_id.clone(),
                     target,
                     task,
-                    correlation_id,
-                    resume_token,
-                } => {
-                    let record = DelegationRecord {
-                        correlation_id,
-                        created_at: SystemTime::now(),
-                        trigger_id: context.metadata.trigger_id.clone(),
-                        target,
-                        task,
-                        resume_token: resume_token.clone(),
-                    };
-                    self.memory
-                        .append_delegation(&context.session_id, record.clone())
-                        .await?;
-                    context.records.push(SessionRecord::Delegation(record));
-                    return self
-                        .finish(
-                            &mut context,
-                            StopReason::Delegated,
-                            None,
-                            Some("delegated to downstream worker".to_string()),
-                            steps_executed + 1,
-                            Some(resume_token),
-                        )
-                        .await;
-                }
+                    resume_token: resume_token.clone(),
+                };
+                self.memory
+                    .append_delegation(&context.session_id, record.clone())
+                    .await?;
+                context
+                    .records
+                    .push(SessionRecord::Delegation(record.clone()));
+                let event = KernelEventRecord {
+                    event_id: format!("delegation-{}", record.correlation_id.as_str()),
+                    occurred_at: record.created_at,
+                    event: KernelEvent::DelegationRequested(record),
+                };
+                self.memory
+                    .append_kernel_event(&context.session_id, event.clone())
+                    .await?;
+                context
+                    .records
+                    .push(SessionRecord::KernelEvent(event.clone()));
+                emitted_events.push(event);
+                let outcome = self
+                    .finish(
+                        &mut context,
+                        StopReason::Delegated,
+                        None,
+                        Some("delegated to downstream worker".to_string()),
+                        steps_executed + 1,
+                        Some(resume_token),
+                    )
+                    .await?;
+                Ok(build_advance_result(outcome, emitted_events))
             }
         }
+    }
+
+    async fn policy_outcome(
+        &self,
+        context: &mut AgentContext,
+        steps_executed: usize,
+        consecutive_tool_failure_steps: usize,
+    ) -> Result<Option<EngineOutcome>, EngineError> {
+        if context.metadata.cancellation.is_cancelled() {
+            return self
+                .finish(
+                    context,
+                    StopReason::Cancelled,
+                    None,
+                    Some("execution cancelled".to_string()),
+                    steps_executed,
+                    None,
+                )
+                .await
+                .map(Some);
+        }
+
+        if Instant::now() >= context.metadata.deadline {
+            return self
+                .finish(
+                    context,
+                    StopReason::DeadlineExceeded,
+                    None,
+                    Some("engine execution deadline exceeded".to_string()),
+                    steps_executed,
+                    None,
+                )
+                .await
+                .map(Some);
+        }
+
+        if steps_executed >= context.metadata.policy.max_steps {
+            return self
+                .finish(
+                    context,
+                    StopReason::MaxStepsReached,
+                    None,
+                    Some("max steps reached".to_string()),
+                    steps_executed,
+                    None,
+                )
+                .await
+                .map(Some);
+        }
+
+        if consecutive_tool_failure_steps >= context.metadata.policy.max_consecutive_tool_failures {
+            return self
+                .finish(
+                    context,
+                    StopReason::PolicyAborted,
+                    None,
+                    Some("max consecutive tool failure steps reached".to_string()),
+                    steps_executed,
+                    None,
+                )
+                .await
+                .map(Some);
+        }
+
+        let cost_so_far = context
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::ProviderUsage(usage) => Some(usage.estimated_cost_usd),
+                _ => None,
+            })
+            .sum::<f64>();
+        if cost_so_far >= context.metadata.policy.max_cost_per_session {
+            return self
+                .finish(
+                    context,
+                    StopReason::PolicyAborted,
+                    None,
+                    Some("session cost limit reached".to_string()),
+                    steps_executed,
+                    None,
+                )
+                .await
+                .map(Some);
+        }
+
+        Ok(None)
+    }
+
+    async fn persist_kernel_events(
+        &self,
+        context: &mut AgentContext,
+        events: &[KernelEventRecord],
+    ) -> Result<(), EngineError> {
+        for event in events {
+            self.memory
+                .append_kernel_event(&context.session_id, event.clone())
+                .await?;
+            context
+                .records
+                .push(SessionRecord::KernelEvent(event.clone()));
+        }
+        Ok(())
     }
 
     async fn persist_provider_metadata(
@@ -934,9 +1109,265 @@ fn error_result(
     }
 }
 
+fn build_advance_result(
+    outcome: EngineOutcome,
+    emitted_events: Vec<KernelEventRecord>,
+) -> AdvanceResult {
+    let wake_request = emitted_events.iter().find_map(extract_wake_request);
+    let state_delta = derive_state_delta(&emitted_events);
+    AdvanceResult {
+        outcome: Some(outcome),
+        emitted_events,
+        state_delta,
+        wake_request,
+    }
+}
+
+fn extract_wake_request(event: &KernelEventRecord) -> Option<WakeRequestRecord> {
+    match &event.event {
+        KernelEvent::WakeRequested(wake) | KernelEvent::WakeScheduled(wake) => Some(wake.clone()),
+        _ => None,
+    }
+}
+
+fn derive_state_delta(events: &[KernelEventRecord]) -> AgentStateDelta {
+    let mut delta = AgentStateDelta::default();
+    for event in events {
+        match &event.event {
+            KernelEvent::GoalCreated(goal) => delta.created_goal_ids.push(goal.goal_id.clone()),
+            KernelEvent::TaskPlanned(task) => delta.updated_task_ids.push(task.task_id.clone()),
+            KernelEvent::TaskClaimed { task_id, .. } => {
+                delta.updated_task_ids.push(task_id.clone())
+            }
+            KernelEvent::TaskBlocked { task_id, .. }
+            | KernelEvent::TaskCompleted { task_id, .. }
+            | KernelEvent::TaskFailed { task_id, .. }
+            | KernelEvent::TaskAbandoned { task_id, .. } => {
+                delta.updated_task_ids.push(task_id.clone())
+            }
+            KernelEvent::HumanInputRequested { task_id, .. } => {
+                if let Some(task_id) = task_id {
+                    delta.updated_task_ids.push(task_id.clone());
+                }
+            }
+            KernelEvent::ObservationAppended(observation) => delta
+                .observation_ids
+                .push(observation.observation_id.clone()),
+            KernelEvent::ArtifactProduced(artifact) => {
+                delta.artifact_ids.push(artifact.artifact_id.clone())
+            }
+            KernelEvent::DelegationRequested(record) => delta
+                .delegation_correlation_ids
+                .push(record.correlation_id.clone()),
+            KernelEvent::DelegationResolved { correlation_id, .. } => delta
+                .delegation_correlation_ids
+                .push(correlation_id.clone()),
+            KernelEvent::WakeRequested(_)
+            | KernelEvent::WakeScheduled(_)
+            | KernelEvent::ResourceRegistered(_)
+            | KernelEvent::RelationshipObserved(_) => {}
+        }
+    }
+    delta
+}
+
+fn derive_trigger_kernel_events(
+    trigger_id: &str,
+    trigger: &AgentTrigger,
+) -> Vec<KernelEventRecord> {
+    let mut events = Vec::new();
+    let observed_at = SystemTime::now();
+    let mut push_observation = |source: String,
+                                content: serde_json::Value,
+                                attachments: Vec<String>| {
+        events.push(KernelEventRecord {
+            event_id: format!("observation-{trigger_id}-{}", events.len()),
+            occurred_at: observed_at,
+            event: KernelEvent::ObservationAppended(crate::ObservationRecord {
+                observation_id: crate::ObservationId(format!("{trigger_id}-obs-{}", events.len())),
+                recorded_at: observed_at,
+                source,
+                content,
+                attachment_ids: attachments,
+                related_resources: Vec::new(),
+            }),
+        });
+    };
+
+    match trigger {
+        AgentTrigger::ExternalEvent {
+            source,
+            payload,
+            attachments,
+        } => push_observation(
+            format!("external:{source}"),
+            payload.clone(),
+            attachments
+                .iter()
+                .map(|attachment| attachment.attachment_id.clone())
+                .collect(),
+        ),
+        AgentTrigger::HumanInput {
+            actor_id,
+            content,
+            attachments,
+        } => push_observation(
+            format!("human:{actor_id}"),
+            serde_json::json!({ "content": content }),
+            attachments
+                .iter()
+                .map(|attachment| attachment.attachment_id.clone())
+                .collect(),
+        ),
+        AgentTrigger::SystemObservation {
+            source,
+            observation,
+            attachments,
+        } => push_observation(
+            format!("system:{source}"),
+            observation.clone(),
+            attachments
+                .iter()
+                .map(|attachment| attachment.attachment_id.clone())
+                .collect(),
+        ),
+        AgentTrigger::Webhook {
+            source,
+            payload,
+            attachments,
+        } => push_observation(
+            format!("webhook:{source}"),
+            payload.clone(),
+            attachments
+                .iter()
+                .map(|attachment| attachment.attachment_id.clone())
+                .collect(),
+        ),
+        AgentTrigger::RuleTrigger {
+            rule_id,
+            context,
+            attachments,
+        } => push_observation(
+            format!("rule:{rule_id}"),
+            context.clone(),
+            attachments
+                .iter()
+                .map(|attachment| attachment.attachment_id.clone())
+                .collect(),
+        ),
+        AgentTrigger::ProactiveHeartbeat { timestamp, .. } => push_observation(
+            "heartbeat".to_string(),
+            serde_json::json!({ "timestamp": timestamp }),
+            Vec::new(),
+        ),
+        AgentTrigger::ScheduledWake {
+            wake_id,
+            due_at,
+            reason,
+        } => events.push(KernelEventRecord {
+            event_id: format!("wake-{trigger_id}"),
+            occurred_at: observed_at,
+            event: KernelEvent::WakeRequested(WakeRequestRecord {
+                wake_id: wake_id.clone(),
+                requested_at: observed_at,
+                due_at: *due_at,
+                reason: reason.clone(),
+                task_id: None,
+            }),
+        }),
+        AgentTrigger::Message {
+            user_id,
+            content,
+            attachments,
+        } => push_observation(
+            format!("message:{user_id}"),
+            serde_json::json!({ "content": content }),
+            attachments
+                .iter()
+                .map(|attachment| attachment.attachment_id.clone())
+                .collect(),
+        ),
+        AgentTrigger::DelegationResult {
+            correlation_id,
+            payload,
+            metadata,
+        } => events.push(KernelEventRecord {
+            event_id: format!("delegation-resolved-{trigger_id}"),
+            occurred_at: observed_at,
+            event: KernelEvent::DelegationResolved {
+                correlation_id: correlation_id.clone(),
+                resolved_at: observed_at,
+                payload: payload.clone(),
+                metadata: metadata.clone(),
+            },
+        }),
+        AgentTrigger::Approval { .. } => {}
+    }
+
+    events
+}
+
 fn build_provider_contents(trigger: &AgentTrigger) -> Vec<ProviderMessage> {
     let mut parts = Vec::new();
     match trigger {
+        AgentTrigger::ExternalEvent {
+            source,
+            payload,
+            attachments,
+        } => {
+            parts.push(ProviderContentPart::Text(format!(
+                "external event source: {source}"
+            )));
+            parts.push(ProviderContentPart::Json(payload.clone()));
+            parts.extend(
+                attachments
+                    .iter()
+                    .cloned()
+                    .map(ProviderContentPart::Attachment),
+            );
+        }
+        AgentTrigger::ScheduledWake {
+            wake_id,
+            due_at,
+            reason,
+        } => {
+            parts.push(ProviderContentPart::Text(format!(
+                "scheduled wake {} due at {:?}: {reason}",
+                wake_id.0, due_at
+            )));
+        }
+        AgentTrigger::HumanInput {
+            actor_id,
+            content,
+            attachments,
+        } => {
+            parts.push(ProviderContentPart::Text(format!(
+                "human actor: {actor_id}"
+            )));
+            parts.push(ProviderContentPart::Text(content.clone()));
+            parts.extend(
+                attachments
+                    .iter()
+                    .cloned()
+                    .map(ProviderContentPart::Attachment),
+            );
+        }
+        AgentTrigger::SystemObservation {
+            source,
+            observation,
+            attachments,
+        } => {
+            parts.push(ProviderContentPart::Text(format!(
+                "system observation source: {source}"
+            )));
+            parts.push(ProviderContentPart::Json(observation.clone()));
+            parts.extend(
+                attachments
+                    .iter()
+                    .cloned()
+                    .map(ProviderContentPart::Attachment),
+            );
+        }
         AgentTrigger::Webhook {
             source,
             payload,
@@ -1051,7 +1482,8 @@ mod tests {
     use crate::{
         AttachmentRef, InMemoryMemoryStore, MockLlmProvider, ProviderCacheRecord, ProviderDecision,
         ProviderError, ProviderErrorKind, ProviderUsageRecord, RecordPageQuery, ResourcePolicy,
-        SessionListQuery, SessionSnapshot, SkillCapability, StopReason,
+        SessionListQuery, SessionSnapshot, SkillCapability, StopReason, TaskId, TaskRecord,
+        TaskStatus,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -1127,6 +1559,26 @@ mod tests {
             .expect("session snapshot")
     }
 
+    async fn run_until_terminal(
+        engine: &AgentEngine,
+        request: ProcessRequest,
+    ) -> Result<EngineOutcome, EngineError> {
+        let mut next = AdvanceRequest::Trigger(request.clone());
+        loop {
+            let result = engine.advance(next).await?;
+            if let Some(outcome) = result.outcome {
+                return Ok(outcome);
+            }
+            next = AdvanceRequest::Continue(ContinueRequest {
+                session_id: request.session_id.clone(),
+                granted_scopes: request.granted_scopes.clone(),
+                policy: request.policy.clone(),
+                provider: request.provider.clone(),
+                cancellation: request.cancellation.clone(),
+            });
+        }
+    }
+
     #[tokio::test]
     async fn webhook_trigger_with_attachment_responds() {
         let store = Arc::new(InMemoryMemoryStore::new());
@@ -1135,8 +1587,9 @@ mod tests {
         }]));
         let engine = AgentEngine::new(llm, store.clone());
 
-        let outcome = engine
-            .process_trigger(ProcessRequest::new(
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new(
                 "session-1",
                 AgentTrigger::Webhook {
                     source: "github".to_string(),
@@ -1148,9 +1601,10 @@ mod tests {
                         vec![1, 2, 3],
                     )],
                 },
-            ))
-            .await
-            .expect("outcome");
+            ),
+        )
+        .await
+        .expect("outcome");
 
         assert_eq!(outcome.stop_reason, StopReason::Responded);
         let snapshot = session(&store, "session-1").await;
@@ -1158,6 +1612,114 @@ mod tests {
             snapshot.records.first(),
             Some(SessionRecord::Trigger(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn advance_executes_one_progression_step() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let llm = Arc::new(MockLlmProvider::scripted(vec![
+            AgentAction::CallSkills(vec![PlannedSkillCall {
+                call_id: "call-1".to_string(),
+                name: "echo".to_string(),
+                args: json!({"value": 1}),
+            }]),
+            AgentAction::Respond {
+                content: "done".to_string(),
+            },
+        ]));
+        let engine = AgentEngine::new(llm, store.clone());
+        engine
+            .register_wasm_skill(
+                manifest("echo", &["tool:run"]),
+                Arc::new(StubSkillExecutor {
+                    name: "stub",
+                    responder: Arc::new(|invocation| Ok(json!({"echo": invocation.args}))),
+                }),
+            )
+            .await;
+        let request =
+            ProcessRequest::new("step-session", message_trigger("run")).with_scope("tool:run");
+
+        let first = engine
+            .advance(AdvanceRequest::Trigger(request.clone()))
+            .await
+            .expect("first advance");
+        assert!(first.outcome.is_none());
+        assert_eq!(first.emitted_events.len(), 1);
+
+        let second = engine
+            .advance(AdvanceRequest::Continue(ContinueRequest {
+                session_id: request.session_id.clone(),
+                granted_scopes: request.granted_scopes.clone(),
+                policy: request.policy.clone(),
+                provider: request.provider.clone(),
+                cancellation: request.cancellation.clone(),
+            }))
+            .await
+            .expect("second advance");
+        assert_eq!(
+            second.outcome.expect("terminal").stop_reason,
+            StopReason::Responded
+        );
+        assert_eq!(
+            store
+                .load_session("step-session")
+                .await
+                .unwrap()
+                .tool_results()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_projects_task_transitions() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let now = SystemTime::now();
+        let task_id = TaskId("task-1".to_string());
+        store
+            .append_kernel_event(
+                "projection-session",
+                KernelEventRecord {
+                    event_id: "task-planned".to_string(),
+                    occurred_at: now,
+                    event: KernelEvent::TaskPlanned(TaskRecord {
+                        task_id: task_id.clone(),
+                        goal_id: None,
+                        parent_task_id: None,
+                        created_at: now,
+                        title: "triage".to_string(),
+                        detail: None,
+                        status: TaskStatus::Ready,
+                        assignee: None,
+                        blocked_by: Vec::new(),
+                    }),
+                },
+            )
+            .await
+            .expect("planned");
+        store
+            .append_kernel_event(
+                "projection-session",
+                KernelEventRecord {
+                    event_id: "task-done".to_string(),
+                    occurred_at: now,
+                    event: KernelEvent::TaskCompleted {
+                        task_id: task_id.clone(),
+                        completed_at: now,
+                        artifact_ids: Vec::new(),
+                    },
+                },
+            )
+            .await
+            .expect("completed");
+
+        let state = store
+            .load_session("projection-session")
+            .await
+            .expect("snapshot")
+            .agent_state();
+        assert_eq!(state.tasks[0].status, TaskStatus::Done);
     }
 
     #[tokio::test]
@@ -1176,11 +1738,10 @@ mod tests {
             },
         )
         .with_idempotency_key("abc");
-        let first = engine
-            .process_trigger(request.clone())
+        let first = run_until_terminal(&engine, request.clone())
             .await
             .expect("first");
-        let second = engine.process_trigger(request).await.expect("second");
+        let second = run_until_terminal(&engine, request).await.expect("second");
         assert_eq!(first.response, second.response);
         assert!(second.idempotent_replay);
         assert_eq!(llm.observed_inputs().len(), 1);
@@ -1239,12 +1800,12 @@ mod tests {
                 .await;
         }
 
-        let outcome = engine
-            .process_trigger(
-                ProcessRequest::new("session-2", message_trigger("run")).with_scope("tool:run"),
-            )
-            .await
-            .expect("outcome");
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new("session-2", message_trigger("run")).with_scope("tool:run"),
+        )
+        .await
+        .expect("outcome");
 
         assert_eq!(outcome.stop_reason, StopReason::Responded);
         let snapshot = session(&store, "session-2").await;
@@ -1279,10 +1840,12 @@ mod tests {
         }));
         let engine = AgentEngine::new(llm, store.clone());
 
-        let outcome = engine
-            .process_trigger(ProcessRequest::new("session-usage", message_trigger("hi")))
-            .await
-            .expect("outcome");
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new("session-usage", message_trigger("hi")),
+        )
+        .await
+        .expect("outcome");
         assert_eq!(outcome.stop_reason, StopReason::Yielded);
 
         let snapshot = session(&store, "session-usage").await;
@@ -1343,27 +1906,28 @@ mod tests {
             )
             .await;
 
-        let suspended = engine
-            .process_trigger(
-                ProcessRequest::new("approval-session", message_trigger("fix"))
-                    .with_scope("db:write"),
-            )
-            .await
-            .expect("suspended");
+        let suspended = run_until_terminal(
+            &engine,
+            ProcessRequest::new("approval-session", message_trigger("fix")).with_scope("db:write"),
+        )
+        .await
+        .expect("suspended");
         assert_eq!(suspended.stop_reason, StopReason::Suspended);
         let token = suspended.resume_token.expect("resume token");
 
-        let resumed = engine
-            .process_trigger(ProcessRequest::new(
+        let resumed = run_until_terminal(
+            &engine,
+            ProcessRequest::new(
                 "approval-session",
                 AgentTrigger::Approval {
                     resume_token: token,
                     decision: ApprovalDecision::Approved,
                     metadata: json!({"approved_by": "human"}),
                 },
-            ))
-            .await
-            .expect("resumed");
+            ),
+        )
+        .await
+        .expect("resumed");
         assert_eq!(resumed.stop_reason, StopReason::Responded);
         assert_eq!(resumed.response.as_deref(), Some("approved-run"));
     }
@@ -1380,13 +1944,12 @@ mod tests {
         }));
         let engine = AgentEngine::new(llm, store);
 
-        let outcome = engine
-            .process_trigger(ProcessRequest::new(
-                "provider-failure",
-                message_trigger("hello"),
-            ))
-            .await
-            .expect("outcome");
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new("provider-failure", message_trigger("hello")),
+        )
+        .await
+        .expect("outcome");
 
         assert_eq!(outcome.stop_reason, StopReason::ProviderFailure);
     }
@@ -1399,10 +1962,12 @@ mod tests {
         }]));
         let engine = AgentEngine::new(llm, store.clone());
         for session_id in ["a", "b"] {
-            engine
-                .process_trigger(ProcessRequest::new(session_id, message_trigger("x")))
-                .await
-                .expect("outcome");
+            run_until_terminal(
+                &engine,
+                ProcessRequest::new(session_id, message_trigger("x")),
+            )
+            .await
+            .expect("outcome");
         }
 
         let sessions = store

@@ -1,3 +1,5 @@
+//! SQLite ledger store for local RainEngine development and tests.
+
 use async_trait::async_trait;
 use rain_engine_core::{
     EngineOutcome, MemoryError, MemoryStore, NewSessionRecord, PendingApprovalRecord, RecordPage,
@@ -267,7 +269,8 @@ impl MemoryStore for SqliteMemoryStore {
 mod tests {
     use super::*;
     use rain_engine_core::{
-        AgentAction, AgentEngine, AgentTrigger, MockLlmProvider, ProcessRequest,
+        AdvanceRequest, AgentAction, AgentEngine, AgentTrigger, ContinueRequest, EngineOutcome,
+        MockLlmProvider, ProcessRequest,
     };
     use std::sync::Arc;
 
@@ -283,17 +286,19 @@ mod tests {
         }]));
         let engine = AgentEngine::new(llm, store.clone());
 
-        engine
-            .process_trigger(ProcessRequest::new(
+        run_until_terminal(
+            &engine,
+            ProcessRequest::new(
                 "sqlite-session",
                 AgentTrigger::Message {
                     user_id: "u".to_string(),
                     content: "hello".to_string(),
                     attachments: Vec::new(),
                 },
-            ))
-            .await
-            .expect("outcome");
+            ),
+        )
+        .await
+        .expect("outcome");
 
         let snapshot = store
             .load_session("sqlite-session")
@@ -307,5 +312,25 @@ mod tests {
             snapshot.records.last(),
             Some(SessionRecord::Outcome(_))
         ));
+    }
+
+    async fn run_until_terminal(
+        engine: &AgentEngine,
+        request: ProcessRequest,
+    ) -> Result<EngineOutcome, rain_engine_core::EngineError> {
+        let mut next = AdvanceRequest::Trigger(request.clone());
+        loop {
+            let result = engine.advance(next).await?;
+            if let Some(outcome) = result.outcome {
+                return Ok(outcome);
+            }
+            next = AdvanceRequest::Continue(ContinueRequest {
+                session_id: request.session_id.clone(),
+                granted_scopes: request.granted_scopes.clone(),
+                policy: request.policy.clone(),
+                provider: request.provider.clone(),
+                cancellation: request.cancellation.clone(),
+            });
+        }
     }
 }

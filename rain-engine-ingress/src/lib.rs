@@ -1,5 +1,11 @@
+//! Event ingress adapters for RainEngine workers.
+//!
+//! This crate provides a shared event envelope and Valkey Streams utilities
+//! that drive the kernel through explicit advance loops.
+
 use rain_engine_core::{
-    AgentEngine, AgentTrigger, EnginePolicy, ProcessRequest, ProviderRequestConfig,
+    AdvanceRequest, AgentEngine, AgentTrigger, ContinueRequest, EnginePolicy, ProcessRequest,
+    ProviderRequestConfig,
 };
 use rain_engine_store_valkey::ValkeyCoordinationStore;
 use redis::cmd;
@@ -134,8 +140,9 @@ impl ValkeyStreamIngress {
         let Some((entry_id, event)) = parse_xreadgroup_payload(read)? else {
             return Ok(false);
         };
-        engine
-            .process_trigger(ProcessRequest {
+        run_until_terminal(
+            engine,
+            ProcessRequest {
                 session_id: event.session_id.clone(),
                 trigger: event.trigger,
                 granted_scopes: event.granted_scopes,
@@ -143,9 +150,10 @@ impl ValkeyStreamIngress {
                 policy: event.policy.unwrap_or_default(),
                 provider: event.provider.unwrap_or_default(),
                 cancellation: tokio_util::sync::CancellationToken::new(),
-            })
-            .await
-            .map_err(|err| IngressError::Message(err.to_string()))?;
+            },
+        )
+        .await
+        .map_err(|err| IngressError::Message(err.to_string()))?;
 
         let client = redis::Client::open(self.config.url.clone())
             .map_err(|err| IngressError::Message(err.to_string()))?;
@@ -167,6 +175,26 @@ impl ValkeyStreamIngress {
         .map_err(|err| IngressError::Message(err.to_string()))??;
 
         Ok(true)
+    }
+}
+
+async fn run_until_terminal(
+    engine: &AgentEngine,
+    request: ProcessRequest,
+) -> Result<rain_engine_core::EngineOutcome, rain_engine_core::EngineError> {
+    let mut next = AdvanceRequest::Trigger(request.clone());
+    loop {
+        let result = engine.advance(next).await?;
+        if let Some(outcome) = result.outcome {
+            return Ok(outcome);
+        }
+        next = AdvanceRequest::Continue(ContinueRequest {
+            session_id: request.session_id.clone(),
+            granted_scopes: request.granted_scopes.clone(),
+            policy: request.policy.clone(),
+            provider: request.provider.clone(),
+            cancellation: request.cancellation.clone(),
+        });
     }
 }
 

@@ -1,3 +1,8 @@
+//! OpenAI-compatible provider adapter for RainEngine.
+//!
+//! This baseline provider maps provider-neutral requests into chat completion
+//! style tool calls.
+
 use async_trait::async_trait;
 use rain_engine_core::{
     AgentAction, LlmProvider, PlannedSkillCall, ProviderContentPart, ProviderDecision,
@@ -338,7 +343,8 @@ mod tests {
     use super::*;
     use axum::{Json, Router, routing::post};
     use rain_engine_core::{
-        AgentContextSnapshot, AgentTrigger, EnginePolicy, SkillDefinition, SkillManifest,
+        AgentContextSnapshot, AgentId, AgentStateSnapshot, AgentTrigger, EnginePolicy,
+        SkillDefinition, SkillManifest,
     };
     use serde_json::json;
 
@@ -359,6 +365,17 @@ mod tests {
                 history: Vec::new(),
                 prior_tool_results: Vec::new(),
                 session_cost_usd: 0.0,
+                state: AgentStateSnapshot {
+                    agent_id: AgentId("s".to_string()),
+                    profile: None,
+                    goals: Vec::new(),
+                    tasks: Vec::new(),
+                    observations: Vec::new(),
+                    artifacts: Vec::new(),
+                    resources: Vec::new(),
+                    relationships: Vec::new(),
+                    pending_wake: None,
+                },
             },
             available_skills: vec![SkillDefinition {
                 manifest: SkillManifest {

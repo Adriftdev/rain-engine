@@ -1,3 +1,5 @@
+//! Procedural macros for RainEngine skill manifests.
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{

@@ -1746,6 +1746,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rain-engine-cognition"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rain-engine-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rain-engine-core"
 version = "0.1.0"
 dependencies = [
@@ -1781,6 +1791,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "rain-engine-memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rain-engine-core",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

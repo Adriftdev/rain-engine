@@ -1,6 +1,6 @@
 use crate::{
     ApprovalResolutionRecord, CoordinationClaimRecord, DelegationRecord, EngineOutcome,
-    ModelDecisionRecord, NewSessionRecord, OutcomeRecord, PendingApprovalRecord,
+    KernelEventRecord, ModelDecisionRecord, NewSessionRecord, OutcomeRecord, PendingApprovalRecord,
     ProviderCacheRecord, ProviderUsageRecord, RecordPage, RecordPageQuery, SessionListQuery,
     SessionRecord, SessionSnapshot, SessionSummary, StoredSessionRecord, ToolCallRecord,
     ToolResultRecord, TriggerRecord,
@@ -75,6 +75,18 @@ pub trait MemoryStoreExt: MemoryStore {
         self.append_record(NewSessionRecord::from_record(
             session_id.to_string(),
             SessionRecord::ModelDecision(record),
+        ))
+        .await
+    }
+
+    async fn append_kernel_event(
+        &self,
+        session_id: &str,
+        record: KernelEventRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::KernelEvent(record),
         ))
         .await
     }

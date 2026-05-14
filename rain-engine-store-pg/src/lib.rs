@@ -1,3 +1,8 @@
+//! Postgres ledger store for RainEngine sessions.
+//!
+//! Records are stored append-only as typed JSONB payloads with sequence numbers
+//! used for deterministic replay and projection.
+
 use async_trait::async_trait;
 use rain_engine_core::{
     EngineOutcome, MemoryError, MemoryStore, NewSessionRecord, PendingApprovalRecord, RecordPage,

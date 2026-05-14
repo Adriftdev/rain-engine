@@ -1,3 +1,8 @@
+//! Reference HTTP runtime for RainEngine.
+//!
+//! The runtime owns request parsing and repeated calls to `AgentEngine::advance`
+//! until a terminal, suspended, delegated, or policy-stopped outcome is reached.
+
 use axum::{
     Json, Router,
     body::to_bytes,
@@ -8,9 +13,10 @@ use axum::{
 use futures_util::stream;
 use rain_engine_blob::{BlobBackendConfig, build_blob_store};
 use rain_engine_core::{
-    AgentEngine, AgentTrigger, ApprovalDecision, AttachmentRef, BlobStore, EngineOutcome,
-    EnginePolicy, InMemoryMemoryStore, LlmProvider, MemoryStore, MockLlmProvider,
-    MultimodalPayload, ProcessRequest, ProviderRequestConfig,
+    AdvanceRequest, AgentEngine, AgentTrigger, ApprovalDecision, AttachmentRef, BlobStore,
+    ContinueRequest, CorrelationId, EngineError, EngineOutcome, EnginePolicy, InMemoryMemoryStore,
+    LlmProvider, MemoryStore, MockLlmProvider, MultimodalPayload, ProcessRequest,
+    ProviderRequestConfig, WakeId,
 };
 use rain_engine_openai::{OpenAiCompatibleConfig, OpenAiCompatibleProvider};
 use rain_engine_provider_gemini::{GeminiAuth, GeminiConfig, GeminiProvider};
@@ -48,6 +54,67 @@ pub struct ApprovalIngressRequest {
     pub session_id: String,
     pub resume_token: String,
     pub decision: ApprovalDecision,
+    #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
+    pub granted_scopes: BTreeSet<String>,
+    #[serde(default)]
+    pub provider: Option<ProviderRequestConfig>,
+    #[serde(default)]
+    pub policy_override: Option<EnginePolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventIngressRequest {
+    pub session_id: String,
+    pub payload: Value,
+    #[serde(default)]
+    pub attachments: Vec<MultimodalPayload>,
+    #[serde(default)]
+    pub granted_scopes: BTreeSet<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub provider: Option<ProviderRequestConfig>,
+    #[serde(default)]
+    pub policy_override: Option<EnginePolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HumanInputIngressRequest {
+    pub session_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<MultimodalPayload>,
+    #[serde(default)]
+    pub granted_scopes: BTreeSet<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub provider: Option<ProviderRequestConfig>,
+    #[serde(default)]
+    pub policy_override: Option<EnginePolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScheduledWakeIngressRequest {
+    pub session_id: String,
+    pub wake_id: String,
+    pub due_at: std::time::SystemTime,
+    pub reason: String,
+    #[serde(default)]
+    pub granted_scopes: BTreeSet<String>,
+    #[serde(default)]
+    pub provider: Option<ProviderRequestConfig>,
+    #[serde(default)]
+    pub policy_override: Option<EnginePolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DelegationResultIngressRequest {
+    pub session_id: String,
+    pub correlation_id: String,
+    pub payload: Value,
     #[serde(default)]
     pub metadata: Value,
     #[serde(default)]
@@ -144,6 +211,12 @@ pub struct RuntimeState {
     memory: Arc<dyn MemoryStore>,
     blob_store: Arc<dyn BlobStore>,
     config: RuntimeServerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeRunResult {
+    pub advances: Vec<rain_engine_core::AdvanceResult>,
+    pub outcome: EngineOutcome,
 }
 
 impl RuntimeState {
@@ -289,7 +362,15 @@ pub async fn build_runtime_state(
 pub fn app(state: RuntimeState) -> Router {
     Router::new()
         .route("/triggers/webhook/{source}", post(handle_webhook))
+        .route("/triggers/external/{source}", post(handle_external_event))
+        .route("/triggers/human/{actor_id}", post(handle_human_input))
+        .route("/triggers/system/{source}", post(handle_system_observation))
+        .route("/triggers/wake", post(handle_scheduled_wake))
         .route("/triggers/approval", post(handle_approval))
+        .route(
+            "/triggers/delegation-result",
+            post(handle_delegation_result),
+        )
         .with_state(state)
 }
 
@@ -298,15 +379,164 @@ pub async fn serve(addr: SocketAddr, state: RuntimeState) -> Result<(), std::io:
     axum::serve(listener, app(state)).await
 }
 
+async fn handle_external_event(
+    State(state): State<RuntimeState>,
+    Path(source): Path<String>,
+    Json(request): Json<EventIngressRequest>,
+) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
+    let policy = effective_policy(&state.config, request.policy_override);
+    let provider = effective_provider(&state.config, request.provider);
+    let attachments = materialize_attachments(
+        &state,
+        policy.max_inline_attachment_bytes,
+        request.attachments,
+    )
+    .await
+    .map_err(map_ingress_error)?;
+    run_process_request(
+        &state,
+        ProcessRequest {
+            session_id: request.session_id,
+            trigger: AgentTrigger::ExternalEvent {
+                source,
+                payload: request.payload,
+                attachments,
+            },
+            granted_scopes: request.granted_scopes,
+            idempotency_key: request.idempotency_key,
+            policy,
+            provider,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await
+}
+
+async fn handle_human_input(
+    State(state): State<RuntimeState>,
+    Path(actor_id): Path<String>,
+    Json(request): Json<HumanInputIngressRequest>,
+) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
+    let policy = effective_policy(&state.config, request.policy_override);
+    let provider = effective_provider(&state.config, request.provider);
+    let attachments = materialize_attachments(
+        &state,
+        policy.max_inline_attachment_bytes,
+        request.attachments,
+    )
+    .await
+    .map_err(map_ingress_error)?;
+    run_process_request(
+        &state,
+        ProcessRequest {
+            session_id: request.session_id,
+            trigger: AgentTrigger::HumanInput {
+                actor_id,
+                content: request.content,
+                attachments,
+            },
+            granted_scopes: request.granted_scopes,
+            idempotency_key: request.idempotency_key,
+            policy,
+            provider,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await
+}
+
+async fn handle_system_observation(
+    State(state): State<RuntimeState>,
+    Path(source): Path<String>,
+    Json(request): Json<EventIngressRequest>,
+) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
+    let policy = effective_policy(&state.config, request.policy_override);
+    let provider = effective_provider(&state.config, request.provider);
+    let attachments = materialize_attachments(
+        &state,
+        policy.max_inline_attachment_bytes,
+        request.attachments,
+    )
+    .await
+    .map_err(map_ingress_error)?;
+    run_process_request(
+        &state,
+        ProcessRequest {
+            session_id: request.session_id,
+            trigger: AgentTrigger::SystemObservation {
+                source,
+                observation: request.payload,
+                attachments,
+            },
+            granted_scopes: request.granted_scopes,
+            idempotency_key: request.idempotency_key,
+            policy,
+            provider,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await
+}
+
+async fn handle_scheduled_wake(
+    State(state): State<RuntimeState>,
+    Json(request): Json<ScheduledWakeIngressRequest>,
+) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
+    let policy = effective_policy(&state.config, request.policy_override);
+    let provider = effective_provider(&state.config, request.provider);
+    run_process_request(
+        &state,
+        ProcessRequest {
+            session_id: request.session_id,
+            trigger: AgentTrigger::ScheduledWake {
+                wake_id: WakeId(request.wake_id),
+                due_at: request.due_at,
+                reason: request.reason,
+            },
+            granted_scopes: request.granted_scopes,
+            idempotency_key: None,
+            policy,
+            provider,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await
+}
+
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt::try_init();
+}
+
+async fn handle_delegation_result(
+    State(state): State<RuntimeState>,
+    Json(request): Json<DelegationResultIngressRequest>,
+) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
+    let policy = effective_policy(&state.config, request.policy_override);
+    let provider = effective_provider(&state.config, request.provider);
+    run_process_request(
+        &state,
+        ProcessRequest {
+            session_id: request.session_id,
+            trigger: AgentTrigger::DelegationResult {
+                correlation_id: CorrelationId(request.correlation_id),
+                payload: request.payload,
+                metadata: request.metadata,
+            },
+            granted_scopes: request.granted_scopes,
+            idempotency_key: None,
+            policy,
+            provider,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await
 }
 
 async fn handle_webhook(
     State(state): State<RuntimeState>,
     Path(source): Path<String>,
     request: Request,
-) -> Result<Json<EngineOutcome>, (StatusCode, String)> {
+) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
     let envelope = parse_webhook_envelope(request)
         .await
         .map_err(map_ingress_error)?;
@@ -342,7 +572,7 @@ async fn handle_webhook(
 async fn handle_approval(
     State(state): State<RuntimeState>,
     Json(request): Json<ApprovalIngressRequest>,
-) -> Result<Json<EngineOutcome>, (StatusCode, String)> {
+) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
     let policy = effective_policy(&state.config, request.policy_override);
     let provider = effective_provider(&state.config, request.provider);
     run_process_request(
@@ -530,13 +760,43 @@ fn effective_provider(
 async fn run_process_request(
     state: &RuntimeState,
     request: ProcessRequest,
-) -> Result<Json<EngineOutcome>, (StatusCode, String)> {
+) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
     let timeout = Duration::from_millis(state.config.request_timeout_ms.max(1));
-    match tokio::time::timeout(timeout, state.engine.process_trigger(request)).await {
-        Ok(Ok(outcome)) => Ok(Json(outcome)),
+    match tokio::time::timeout(timeout, run_until_terminal_trace(&state.engine, request)).await {
+        Ok(Ok(result)) => Ok(Json(result)),
         Ok(Err(err)) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
         Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "request timed out".to_string())),
     }
+}
+
+pub async fn run_until_terminal_trace(
+    engine: &AgentEngine,
+    request: ProcessRequest,
+) -> Result<RuntimeRunResult, EngineError> {
+    let mut advances = Vec::new();
+    let mut next = AdvanceRequest::Trigger(request.clone());
+    loop {
+        let result = engine.advance(next).await?;
+        if let Some(outcome) = result.outcome.clone() {
+            advances.push(result);
+            return Ok(RuntimeRunResult { advances, outcome });
+        }
+        advances.push(result);
+        next = AdvanceRequest::Continue(ContinueRequest {
+            session_id: request.session_id.clone(),
+            granted_scopes: request.granted_scopes.clone(),
+            policy: request.policy.clone(),
+            provider: request.provider.clone(),
+            cancellation: request.cancellation.clone(),
+        });
+    }
+}
+
+pub async fn run_until_terminal(
+    engine: &AgentEngine,
+    request: ProcessRequest,
+) -> Result<EngineOutcome, EngineError> {
+    Ok(run_until_terminal_trace(engine, request).await?.outcome)
 }
 
 fn map_ingress_error(error: IngressError) -> (StatusCode, String) {
@@ -636,9 +896,10 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        let outcome: EngineOutcome = serde_json::from_slice(&bytes).expect("outcome");
-        assert_eq!(outcome.stop_reason, StopReason::Responded);
-        assert_eq!(outcome.response.as_deref(), Some("processed"));
+        let run: RuntimeRunResult = serde_json::from_slice(&bytes).expect("run result");
+        assert_eq!(run.outcome.stop_reason, StopReason::Responded);
+        assert_eq!(run.outcome.response.as_deref(), Some("processed"));
+        assert!(!run.advances.is_empty());
     }
 
     #[tokio::test]
@@ -767,9 +1028,9 @@ mod tests {
         let start_bytes = axum::body::to_bytes(start.into_body(), usize::MAX)
             .await
             .expect("body");
-        let suspended: EngineOutcome = serde_json::from_slice(&start_bytes).expect("outcome");
-        assert_eq!(suspended.stop_reason, StopReason::Suspended);
-        let resume_token = suspended.resume_token.expect("resume token").0;
+        let suspended: RuntimeRunResult = serde_json::from_slice(&start_bytes).expect("outcome");
+        assert_eq!(suspended.outcome.stop_reason, StopReason::Suspended);
+        let resume_token = suspended.outcome.resume_token.expect("resume token").0;
 
         let resume = app(state)
             .oneshot(
@@ -795,9 +1056,9 @@ mod tests {
         let resume_bytes = axum::body::to_bytes(resume.into_body(), usize::MAX)
             .await
             .expect("body");
-        let resumed: EngineOutcome = serde_json::from_slice(&resume_bytes).expect("outcome");
-        assert_eq!(resumed.stop_reason, StopReason::Responded);
-        assert_eq!(resumed.response.as_deref(), Some("completed"));
+        let resumed: RuntimeRunResult = serde_json::from_slice(&resume_bytes).expect("outcome");
+        assert_eq!(resumed.outcome.stop_reason, StopReason::Responded);
+        assert_eq!(resumed.outcome.response.as_deref(), Some("completed"));
     }
 
     #[tokio::test]
