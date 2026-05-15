@@ -1,0 +1,28 @@
+[package]
+name = "rain-engine-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rain-engine-gateway"
+path = "src/main.rs"
+
+[dependencies]
+rain-engine = { path = ".." }
+rain-engine-runtime = { path = "../rain-engine-runtime" }
+rain-engine-blob = { path = "../rain-engine-blob" }
+rain-engine-channels = { path = "../rain-engine-channels" }
+rain-engine-client = { path = "../rain-engine-client" }
+rain-engine-core = { path = "../rain-engine-core" }
+rain-engine-skills = { path = "../rain-engine-skills" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+tower-http = { workspace = true }
+axum = { workspace = true }
+dotenvy = "0.15.7"

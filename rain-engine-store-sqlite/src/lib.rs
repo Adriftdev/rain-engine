@@ -308,10 +308,12 @@ mod tests {
             snapshot.records.first(),
             Some(SessionRecord::Trigger(_))
         ));
-        assert!(matches!(
-            snapshot.records.last(),
-            Some(SessionRecord::Outcome(_))
-        ));
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .any(|record| matches!(record, SessionRecord::Outcome(_)))
+        );
     }
 
     async fn run_until_terminal(

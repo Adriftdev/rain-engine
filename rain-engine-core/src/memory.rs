@@ -1,9 +1,10 @@
 use crate::{
     ApprovalResolutionRecord, CoordinationClaimRecord, DelegationRecord, EngineOutcome,
     KernelEventRecord, ModelDecisionRecord, NewSessionRecord, OutcomeRecord, PendingApprovalRecord,
-    ProviderCacheRecord, ProviderUsageRecord, RecordPage, RecordPageQuery, SessionListQuery,
-    SessionRecord, SessionSnapshot, SessionSummary, StoredSessionRecord, ToolCallRecord,
-    ToolResultRecord, TriggerRecord,
+    PolicyTuningRecord, ProfilePatchRecord, ProviderCacheRecord, ProviderUsageRecord, RecordPage,
+    RecordPageQuery, ReflectionRecord, SessionListQuery, SessionRecord, SessionSnapshot,
+    SessionSummary, StoredSessionRecord, StrategyPreferenceRecord, ToolCallRecord,
+    ToolPerformanceRecord, ToolResultRecord, TriggerRecord,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -183,6 +184,66 @@ pub trait MemoryStoreExt: MemoryStore {
         self.append_record(NewSessionRecord::from_record(
             session_id.to_string(),
             SessionRecord::ProviderCache(record),
+        ))
+        .await
+    }
+
+    async fn append_reflection(
+        &self,
+        session_id: &str,
+        record: ReflectionRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::Reflection(record),
+        ))
+        .await
+    }
+
+    async fn append_policy_tuning(
+        &self,
+        session_id: &str,
+        record: PolicyTuningRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::PolicyTuning(record),
+        ))
+        .await
+    }
+
+    async fn append_strategy_preference(
+        &self,
+        session_id: &str,
+        record: StrategyPreferenceRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::StrategyPreference(record),
+        ))
+        .await
+    }
+
+    async fn append_tool_performance(
+        &self,
+        session_id: &str,
+        record: ToolPerformanceRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::ToolPerformance(record),
+        ))
+        .await
+    }
+
+    async fn append_profile_patch(
+        &self,
+        session_id: &str,
+        record: ProfilePatchRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::ProfilePatch(record),
         ))
         .await
     }

@@ -1,0 +1,29 @@
+{
+  "name": "@rain-engine/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the RainEngine Gateway — strongly-typed client and domain types for event-sourced AI agent systems",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "rain-engine.ts",
+    "client.ts",
+    "index.ts"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "generate": "cd ../.. && ./scripts/generate_sdks.sh"
+  },
+  "keywords": [
+    "rain-engine",
+    "ai-agent",
+    "event-sourced",
+    "sdk",
+    "typescript"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

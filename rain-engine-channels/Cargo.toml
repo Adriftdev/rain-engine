@@ -1,0 +1,15 @@
+[package]
+name = "rain-engine-channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+rain-engine-client = { path = "../rain-engine-client" }
+reqwest = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true

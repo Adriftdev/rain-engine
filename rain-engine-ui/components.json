@@ -1,0 +1,9 @@
+{
+  "$schema": "https://park-ui.com/schema.json",
+  "cssFramework": "panda",
+  "jsFramework": "solid",
+  "aliases": {
+    "components": "~/components/ui",
+    "utils": "~/lib"
+  }
+}

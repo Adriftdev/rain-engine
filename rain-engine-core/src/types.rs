@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MultimodalPayload {
     pub mime_type: String,
@@ -11,18 +12,22 @@ pub struct MultimodalPayload {
     pub data: Vec<u8>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlobDescriptor {
     pub uri: String,
     pub size_bytes: usize,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "payload")]
 pub enum AttachmentContent {
     Inline { data: Vec<u8> },
     Blob { descriptor: BlobDescriptor },
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentRef {
     pub attachment_id: String,
@@ -64,12 +69,14 @@ impl AttachmentRef {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Approved,
     Rejected,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeToken(pub String);
 
@@ -79,6 +86,7 @@ impl ResumeToken {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CorrelationId(pub String);
 
@@ -88,24 +96,31 @@ impl CorrelationId {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AgentId(pub String);
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GoalId(pub String);
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskId(pub String);
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArtifactId(pub String);
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObservationId(pub String);
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WakeId(pub String);
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceRef {
     pub resource_id: String,
@@ -114,6 +129,7 @@ pub struct ResourceRef {
     pub external_ref: Option<String>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelationshipEdge {
     pub from_resource_id: String,
@@ -122,6 +138,7 @@ pub struct RelationshipEdge {
     pub observed_at: SystemTime,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GoalStatus {
     Active,
@@ -130,6 +147,7 @@ pub enum GoalStatus {
     Cancelled,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskStatus {
     Pending,
@@ -142,6 +160,7 @@ pub enum TaskStatus {
     Abandoned,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryPolicy {
     pub max_recent_items: usize,
@@ -154,11 +173,12 @@ impl Default for MemoryPolicy {
         Self {
             max_recent_items: 32,
             semantic_retrieval_limit: 8,
-            graph_hops: 2,
+            graph_hops: 6,
         }
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EscalationPolicy {
     pub require_human_approval_scopes: Vec<String>,
@@ -169,11 +189,12 @@ impl Default for EscalationPolicy {
     fn default() -> Self {
         Self {
             require_human_approval_scopes: vec!["scope:human_approval".to_string()],
-            max_auto_delegations: 4,
+            max_auto_delegations: 50,
         }
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WakePolicy {
     pub allow_scheduled_wakes: bool,
@@ -191,6 +212,7 @@ impl Default for WakePolicy {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewPolicy {
     pub require_review_for_native_skills: bool,
@@ -208,6 +230,7 @@ impl Default for ReviewPolicy {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentProfile {
     pub agent_id: AgentId,
@@ -222,6 +245,7 @@ pub struct AgentProfile {
     pub config_artifact: Option<ArtifactId>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GoalRecord {
     pub goal_id: GoalId,
@@ -232,6 +256,7 @@ pub struct GoalRecord {
     pub parent_goal_id: Option<GoalId>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskRecord {
     pub task_id: TaskId,
@@ -245,6 +270,7 @@ pub struct TaskRecord {
     pub blocked_by: Vec<TaskId>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObservationRecord {
     pub observation_id: ObservationId,
@@ -255,6 +281,7 @@ pub struct ObservationRecord {
     pub related_resources: Vec<ResourceRef>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArtifactRecord {
     pub artifact_id: ArtifactId,
@@ -265,6 +292,7 @@ pub struct ArtifactRecord {
     pub metadata: Value,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WakeRequestRecord {
     pub wake_id: WakeId,
@@ -274,6 +302,7 @@ pub struct WakeRequestRecord {
     pub task_id: Option<TaskId>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentStateSnapshot {
     pub agent_id: AgentId,
@@ -287,6 +316,7 @@ pub struct AgentStateSnapshot {
     pub pending_wake: Option<WakeRequestRecord>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AgentStateDelta {
     pub created_goal_ids: Vec<GoalId>,
@@ -296,7 +326,9 @@ pub struct AgentStateDelta {
     pub delegation_correlation_ids: Vec<CorrelationId>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
 pub enum KernelEvent {
     GoalCreated(GoalRecord),
     TaskPlanned(TaskRecord),
@@ -346,6 +378,7 @@ pub enum KernelEvent {
     RelationshipObserved(RelationshipEdge),
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KernelEventRecord {
     pub event_id: String,
@@ -353,19 +386,23 @@ pub struct KernelEventRecord {
     pub event: KernelEvent,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationTarget {
     pub stream: String,
     pub worker: Option<String>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DelegationTask {
     pub task_type: String,
     pub payload: Value,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
 pub enum AgentTrigger {
     ExternalEvent {
         source: String,
@@ -435,6 +472,7 @@ impl AgentTrigger {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TriggerRecord {
     pub trigger_id: String,
@@ -444,12 +482,14 @@ pub struct TriggerRecord {
     pub trigger: AgentTrigger,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ContinueReason {
     ToolResultAppended,
     ModelRequested,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlannedSkillCall {
     pub call_id: String,
@@ -457,13 +497,17 @@ pub struct PlannedSkillCall {
     pub args: Value,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
 pub enum SuspendReason {
     HumanApprovalRequired { skill_names: Vec<String> },
     ProviderRequested { message: String },
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
 pub enum AgentAction {
     Respond {
         content: String,
@@ -488,6 +532,7 @@ pub enum AgentAction {
     },
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelDecisionRecord {
     pub step: usize,
@@ -495,6 +540,7 @@ pub struct ModelDecisionRecord {
     pub action: AgentAction,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourcePolicy {
     pub timeout_ms: u64,
@@ -520,13 +566,16 @@ impl ResourcePolicy {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "payload")]
 pub enum SkillCapability {
     KeyValueRead { namespaces: Vec<String> },
     HttpOutbound { allow_hosts: Vec<String> },
     StructuredLog,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillBackendKind {
@@ -534,6 +583,7 @@ pub enum SkillBackendKind {
     Native,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillManifest {
     pub name: String,
@@ -559,12 +609,14 @@ pub trait SkillManifestDescriptor {
     fn skill_manifest() -> SkillManifest;
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillDefinition {
     pub manifest: SkillManifest,
     pub executor_kind: String,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCallRecord {
     pub call_id: String,
@@ -575,6 +627,7 @@ pub struct ToolCallRecord {
     pub backend_kind: SkillBackendKind,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SkillFailureKind {
     PermissionDenied,
@@ -586,12 +639,14 @@ pub enum SkillFailureKind {
     Internal,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillFailure {
     pub kind: SkillFailureKind,
     pub message: String,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResultRecord {
     pub call_id: String,
@@ -600,6 +655,7 @@ pub struct ToolResultRecord {
     pub output: Result<Value, SkillFailure>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingApprovalRecord {
     pub resume_token: ResumeToken,
@@ -610,6 +666,7 @@ pub struct PendingApprovalRecord {
     pub pending_calls: Vec<PlannedSkillCall>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApprovalResolutionRecord {
     pub resume_token: ResumeToken,
@@ -618,6 +675,7 @@ pub struct ApprovalResolutionRecord {
     pub metadata: Value,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DelegationRecord {
     pub correlation_id: CorrelationId,
@@ -628,6 +686,7 @@ pub struct DelegationRecord {
     pub resume_token: ResumeToken,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CoordinationClaimRecord {
     pub claim_id: String,
@@ -636,6 +695,7 @@ pub struct CoordinationClaimRecord {
     pub expires_at: SystemTime,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderUsageRecord {
     pub provider_name: String,
@@ -646,6 +706,7 @@ pub struct ProviderUsageRecord {
     pub cached_content_id: Option<String>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderCacheRecord {
     pub provider_name: String,
@@ -654,6 +715,179 @@ pub struct ProviderCacheRecord {
     pub cached_at: SystemTime,
 }
 
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SelfImprovementMode {
+    Advisory,
+    AutoWithGuardrails,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SelfImprovementPolicy {
+    pub enabled: bool,
+    pub mode: SelfImprovementMode,
+    pub reflection_interval_records: usize,
+    pub min_observations_before_tuning: usize,
+    pub max_policy_delta_percent: f64,
+    pub require_approval_for_scope_expansion: bool,
+    pub rollback_on_regression: bool,
+}
+
+impl Default for SelfImprovementPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: SelfImprovementMode::AutoWithGuardrails,
+            reflection_interval_records: 8,
+            min_observations_before_tuning: 2,
+            max_policy_delta_percent: 25.0,
+            require_approval_for_scope_expansion: true,
+            rollback_on_regression: true,
+        }
+    }
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PolicyOverlayPatch {
+    pub max_steps: Option<usize>,
+    pub max_execution_time_ms: Option<u64>,
+    pub provider_timeout_ms: Option<u64>,
+    pub max_tool_timeout_ms: Option<u64>,
+    pub max_parallel_skill_calls: Option<usize>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PolicyOverlayStatus {
+    Proposed,
+    Applied,
+    RolledBack,
+    Rejected,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PolicyOverlay {
+    pub overlay_id: String,
+    pub created_at: SystemTime,
+    pub status: PolicyOverlayStatus,
+    pub reason: String,
+    pub evidence_window_records: usize,
+    pub patch: PolicyOverlayPatch,
+    pub confidence: f64,
+    pub rollback_condition: String,
+}
+
+impl PolicyOverlay {
+    pub fn apply_to(&self, policy: &mut EnginePolicy) {
+        if self.status != PolicyOverlayStatus::Applied {
+            return;
+        }
+        if let Some(value) = self.patch.max_steps {
+            policy.max_steps = value.max(1);
+        }
+        if let Some(value) = self.patch.max_execution_time_ms {
+            policy.max_execution_time_ms = value.max(1);
+        }
+        if let Some(value) = self.patch.provider_timeout_ms {
+            policy.provider_timeout_ms = value.max(1);
+        }
+        if let Some(value) = self.patch.max_tool_timeout_ms {
+            policy.max_tool_timeout_ms = value.max(1);
+        }
+        if let Some(value) = self.patch.max_parallel_skill_calls {
+            policy.max_parallel_skill_calls = value.max(1);
+        }
+    }
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PolicyTuningAction {
+    Proposed,
+    Applied,
+    RolledBack,
+    RejectedUnsafe,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReflectionRecord {
+    pub reflection_id: String,
+    pub created_at: SystemTime,
+    pub trigger_id: String,
+    pub summary: String,
+    pub observations: Vec<String>,
+    pub confidence: f64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PolicyTuningRecord {
+    pub tuning_id: String,
+    pub created_at: SystemTime,
+    pub overlay: PolicyOverlay,
+    pub action: PolicyTuningAction,
+    pub prior_policy: EnginePolicy,
+    pub projected_policy: EnginePolicy,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StrategyPreferenceRecord {
+    pub preference_id: String,
+    pub created_at: SystemTime,
+    pub skill_name: Option<String>,
+    pub preference: String,
+    pub reason: String,
+    pub confidence: f64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolPerformanceRecord {
+    pub performance_id: String,
+    pub created_at: SystemTime,
+    pub skill_name: String,
+    pub backend_kind: String,
+    pub calls: usize,
+    pub successes: usize,
+    pub failures: usize,
+    pub failure_rate: f64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfilePatchRecord {
+    pub patch_id: String,
+    pub created_at: SystemTime,
+    pub description: String,
+    pub patch: Value,
+    pub requires_approval: bool,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelfImprovementInput {
+    pub session_id: String,
+    pub records: Vec<SessionRecord>,
+    pub latest_outcome: OutcomeRecord,
+    pub current_policy: EnginePolicy,
+    pub active_overlay: Option<PolicyOverlay>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SelfImprovementAdvice {
+    pub reflections: Vec<ReflectionRecord>,
+    pub policy_tunings: Vec<PolicyTuningRecord>,
+    pub strategy_preferences: Vec<StrategyPreferenceRecord>,
+    pub tool_performance: Vec<ToolPerformanceRecord>,
+    pub profile_patches: Vec<ProfilePatchRecord>,
+}
+
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StopReason {
     Responded,
@@ -668,6 +902,7 @@ pub enum StopReason {
     Delegated,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutcomeRecord {
     pub trigger_id: String,
@@ -680,7 +915,10 @@ pub struct OutcomeRecord {
     pub resume_token: Option<ResumeToken>,
 }
 
+#[typeshare::typeshare]
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
 pub enum SessionRecord {
     Trigger(TriggerRecord),
     KernelEvent(KernelEventRecord),
@@ -693,9 +931,15 @@ pub enum SessionRecord {
     CoordinationClaim(CoordinationClaimRecord),
     ProviderUsage(ProviderUsageRecord),
     ProviderCache(ProviderCacheRecord),
+    Reflection(ReflectionRecord),
+    PolicyTuning(PolicyTuningRecord),
+    StrategyPreference(StrategyPreferenceRecord),
+    ToolPerformance(ToolPerformanceRecord),
+    ProfilePatch(ProfilePatchRecord),
     Outcome(OutcomeRecord),
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRecordKind {
@@ -710,6 +954,11 @@ pub enum SessionRecordKind {
     CoordinationClaim,
     ProviderUsage,
     ProviderCache,
+    Reflection,
+    PolicyTuning,
+    StrategyPreference,
+    ToolPerformance,
+    ProfilePatch,
     Outcome,
 }
 
@@ -727,6 +976,11 @@ impl SessionRecordKind {
             SessionRecordKind::CoordinationClaim => "coordination_claim",
             SessionRecordKind::ProviderUsage => "provider_usage",
             SessionRecordKind::ProviderCache => "provider_cache",
+            SessionRecordKind::Reflection => "reflection",
+            SessionRecordKind::PolicyTuning => "policy_tuning",
+            SessionRecordKind::StrategyPreference => "strategy_preference",
+            SessionRecordKind::ToolPerformance => "tool_performance",
+            SessionRecordKind::ProfilePatch => "profile_patch",
             SessionRecordKind::Outcome => "outcome",
         }
     }
@@ -744,6 +998,11 @@ impl SessionRecordKind {
             "coordination_claim" => Some(SessionRecordKind::CoordinationClaim),
             "provider_usage" => Some(SessionRecordKind::ProviderUsage),
             "provider_cache" => Some(SessionRecordKind::ProviderCache),
+            "reflection" => Some(SessionRecordKind::Reflection),
+            "policy_tuning" => Some(SessionRecordKind::PolicyTuning),
+            "strategy_preference" => Some(SessionRecordKind::StrategyPreference),
+            "tool_performance" => Some(SessionRecordKind::ToolPerformance),
+            "profile_patch" => Some(SessionRecordKind::ProfilePatch),
             "outcome" => Some(SessionRecordKind::Outcome),
             _ => None,
         }
@@ -764,6 +1023,11 @@ impl SessionRecord {
             SessionRecord::CoordinationClaim(_) => SessionRecordKind::CoordinationClaim,
             SessionRecord::ProviderUsage(_) => SessionRecordKind::ProviderUsage,
             SessionRecord::ProviderCache(_) => SessionRecordKind::ProviderCache,
+            SessionRecord::Reflection(_) => SessionRecordKind::Reflection,
+            SessionRecord::PolicyTuning(_) => SessionRecordKind::PolicyTuning,
+            SessionRecord::StrategyPreference(_) => SessionRecordKind::StrategyPreference,
+            SessionRecord::ToolPerformance(_) => SessionRecordKind::ToolPerformance,
+            SessionRecord::ProfilePatch(_) => SessionRecordKind::ProfilePatch,
             SessionRecord::Outcome(_) => SessionRecordKind::Outcome,
         }
     }
@@ -781,6 +1045,11 @@ impl SessionRecord {
             SessionRecord::CoordinationClaim(record) => record.claimed_at,
             SessionRecord::ProviderUsage(record) => record.recorded_at,
             SessionRecord::ProviderCache(record) => record.cached_at,
+            SessionRecord::Reflection(record) => record.created_at,
+            SessionRecord::PolicyTuning(record) => record.created_at,
+            SessionRecord::StrategyPreference(record) => record.created_at,
+            SessionRecord::ToolPerformance(record) => record.created_at,
+            SessionRecord::ProfilePatch(record) => record.created_at,
             SessionRecord::Outcome(record) => record.finished_at,
         }
     }
@@ -790,6 +1059,7 @@ impl SessionRecord {
             SessionRecord::Trigger(record) => Some(&record.trigger_id),
             SessionRecord::PendingApproval(record) => Some(&record.trigger_id),
             SessionRecord::Delegation(record) => Some(&record.trigger_id),
+            SessionRecord::Reflection(record) => Some(&record.trigger_id),
             SessionRecord::Outcome(record) => Some(&record.trigger_id),
             _ => None,
         }
@@ -804,6 +1074,7 @@ impl SessionRecord {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredSessionRecord {
     pub session_id: String,
@@ -815,6 +1086,7 @@ pub struct StoredSessionRecord {
     pub record: SessionRecord,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NewSessionRecord {
     pub session_id: String,
@@ -841,6 +1113,7 @@ impl NewSessionRecord {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionSnapshot {
     pub session_id: String,
@@ -887,6 +1160,72 @@ impl SessionSnapshot {
             }
             _ => None,
         })
+    }
+
+    pub fn active_policy_overlay(&self) -> Option<PolicyOverlay> {
+        let rolled_back = self
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::PolicyTuning(tuning)
+                    if tuning.action == PolicyTuningAction::RolledBack =>
+                {
+                    Some(tuning.overlay.overlay_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+
+        self.records.iter().rev().find_map(|record| match record {
+            SessionRecord::PolicyTuning(tuning)
+                if tuning.action == PolicyTuningAction::Applied
+                    && tuning.overlay.status == PolicyOverlayStatus::Applied
+                    && !rolled_back.contains(&tuning.overlay.overlay_id) =>
+            {
+                Some(tuning.overlay.clone())
+            }
+            _ => None,
+        })
+    }
+
+    pub fn reflections(&self) -> Vec<ReflectionRecord> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::Reflection(reflection) => Some(reflection.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn policy_tunings(&self) -> Vec<PolicyTuningRecord> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::PolicyTuning(tuning) => Some(tuning.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn strategy_preferences(&self) -> Vec<StrategyPreferenceRecord> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::StrategyPreference(preference) => Some(preference.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn tool_performance_records(&self) -> Vec<ToolPerformanceRecord> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::ToolPerformance(performance) => Some(performance.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn active_trigger(&self) -> Option<TriggerRecord> {
@@ -1015,10 +1354,10 @@ impl SessionSnapshot {
                     }
                 }
                 KernelEvent::HumanInputRequested { task_id, .. } => {
-                    if let Some(task_id) = task_id {
-                        if let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id) {
-                            task.status = TaskStatus::WaitingHuman;
-                        }
+                    if let Some(task_id) = task_id
+                        && let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id)
+                    {
+                        task.status = TaskStatus::WaitingHuman;
                     }
                 }
                 KernelEvent::ObservationAppended(observation) => observations.push(observation),
@@ -1076,6 +1415,7 @@ impl SessionSnapshot {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionSummary {
     pub session_id: String,
@@ -1084,6 +1424,7 @@ pub struct SessionSummary {
     pub record_count: usize,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionListQuery {
     pub offset: usize,
@@ -1103,6 +1444,7 @@ impl Default for SessionListQuery {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecordPageQuery {
     pub session_id: String,
@@ -1124,6 +1466,7 @@ impl RecordPageQuery {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RecordPage {
     pub session_id: String,
@@ -1131,6 +1474,7 @@ pub struct RecordPage {
     pub next_offset: Option<usize>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EnginePolicy {
     pub max_steps: usize,
@@ -1143,26 +1487,36 @@ pub struct EnginePolicy {
     pub max_parallel_skill_calls: usize,
     pub max_inline_attachment_bytes: usize,
     pub allow_native_skills: bool,
+    #[serde(default)]
+    pub self_improvement: SelfImprovementPolicy,
 }
 
 impl Default for EnginePolicy {
     fn default() -> Self {
         Self {
             max_steps: 16,
-            max_execution_time_ms: 30_000,
-            provider_timeout_ms: 15_000,
-            max_tool_timeout_ms: 5_000,
-            max_consecutive_tool_failures: 3,
+            max_execution_time_ms: 120_000,
+            provider_timeout_ms: 45_000,
+            max_tool_timeout_ms: 10_000,
+            max_consecutive_tool_failures: 20,
             cache_threshold_tokens: 32_000,
             max_cost_per_session: 5.0,
             max_parallel_skill_calls: 4,
             max_inline_attachment_bytes: 512 * 1024,
             allow_native_skills: true,
+            self_improvement: SelfImprovementPolicy::default(),
         }
     }
 }
 
 impl EnginePolicy {
+    pub fn with_overlay(mut self, overlay: Option<PolicyOverlay>) -> Self {
+        if let Some(overlay) = overlay {
+            overlay.apply_to(&mut self);
+        }
+        self
+    }
+
     pub fn max_execution_time(&self) -> Duration {
         Duration::from_millis(self.max_execution_time_ms.max(1))
     }
@@ -1172,6 +1526,7 @@ impl EnginePolicy {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ProviderRequestConfig {
     pub model: Option<String>,
@@ -1179,6 +1534,7 @@ pub struct ProviderRequestConfig {
     pub max_tokens: Option<u32>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ProviderRole {
     System,
@@ -1187,7 +1543,9 @@ pub enum ProviderRole {
     Tool,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
 pub enum ProviderContentPart {
     Text(String),
     Json(Value),
@@ -1196,6 +1554,7 @@ pub enum ProviderContentPart {
     ToolResult(ToolResultRecord),
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderMessage {
     pub role: ProviderRole,
@@ -1252,6 +1611,7 @@ impl AgentContext {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentContextSnapshot {
     pub session_id: String,
@@ -1348,6 +1708,7 @@ pub enum AdvanceRequest {
     Continue(ContinueRequest),
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AdvanceResult {
     pub outcome: Option<EngineOutcome>,
@@ -1356,6 +1717,7 @@ pub struct AdvanceResult {
     pub wake_request: Option<WakeRequestRecord>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderRequest {
     pub trigger: AgentTrigger,
@@ -1366,6 +1728,7 @@ pub struct ProviderRequest {
     pub contents: Vec<ProviderMessage>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderDecision {
     pub action: AgentAction,
@@ -1373,6 +1736,7 @@ pub struct ProviderDecision {
     pub cache: Option<ProviderCacheRecord>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillInvocation {
     pub call_id: String,
@@ -1381,6 +1745,7 @@ pub struct SkillInvocation {
     pub context: AgentContextSnapshot,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EngineOutcome {
     pub trigger_id: String,

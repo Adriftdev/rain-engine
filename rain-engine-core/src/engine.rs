@@ -3,20 +3,23 @@ use crate::{
     ApprovalDecision, ApprovalResolutionRecord, ContinueRequest, DelegationRecord, EngineOutcome,
     ExecutionMetadata, KernelEvent, KernelEventRecord, LlmProvider, MemoryError, MemoryStore,
     MemoryStoreExt, ModelDecisionRecord, OutcomeRecord, PendingApprovalRecord, PlannedSkillCall,
-    ProcessRequest, ProviderContentPart, ProviderDecision, ProviderMessage, ProviderRequest,
-    ProviderRole, ResumeToken, SessionRecord, SkillBackendKind, SkillDefinition, SkillFailure,
-    SkillFailureKind, SkillInvocation, SkillManifest, StopReason, SuspendReason, ToolCallRecord,
-    ToolResultRecord, TriggerRecord, WakeRequestRecord,
+    PolicyOverlay, PolicyOverlayPatch, PolicyOverlayStatus, PolicyTuningAction, PolicyTuningRecord,
+    ProcessRequest, ProfilePatchRecord, ProviderContentPart, ProviderDecision, ProviderMessage,
+    ProviderRequest, ProviderRole, ReflectionRecord, ResumeToken, SelfImprovementMode,
+    SessionRecord, SessionSnapshot, SkillBackendKind, SkillDefinition, SkillFailure,
+    SkillFailureKind, SkillInvocation, SkillManifest, StopReason, StrategyPreferenceRecord,
+    SuspendReason, ToolCallRecord, ToolPerformanceRecord, ToolResultRecord, TriggerRecord,
+    WakeRequestRecord,
 };
 use async_trait::async_trait;
-use metrics::{counter, histogram};
+use dashmap::DashMap;
+use metrics::{counter, gauge, histogram};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use thiserror::Error;
-use tokio::sync::RwLock;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -25,6 +28,39 @@ pub enum EngineError {
     Memory(#[from] MemoryError),
     #[error("blob error: {0}")]
     Blob(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineErrorKind {
+    Storage,
+    Blob,
+    Join,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineErrorSeverity {
+    Recoverable,
+    Fatal,
+}
+
+impl EngineError {
+    pub fn kind(&self) -> EngineErrorKind {
+        match self {
+            EngineError::Memory(_) => EngineErrorKind::Storage,
+            EngineError::Blob(_) => EngineErrorKind::Blob,
+        }
+    }
+
+    pub fn severity(&self) -> EngineErrorSeverity {
+        match self {
+            EngineError::Memory(_) => EngineErrorSeverity::Fatal,
+            EngineError::Blob(_) => EngineErrorSeverity::Recoverable,
+        }
+    }
+
+    pub fn is_recoverable(&self) -> bool {
+        self.severity() == EngineErrorSeverity::Recoverable
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -121,7 +157,7 @@ impl RegisteredSkill {
 pub struct AgentEngine {
     llm: Arc<dyn LlmProvider>,
     memory: Arc<dyn MemoryStore>,
-    skills: Arc<RwLock<HashMap<String, RegisteredSkill>>>,
+    skills: Arc<DashMap<String, RegisteredSkill>>,
 }
 
 impl AgentEngine {
@@ -129,7 +165,7 @@ impl AgentEngine {
         Self {
             llm,
             memory,
-            skills: Arc::new(RwLock::new(HashMap::new())),
+            skills: Arc::new(DashMap::new()),
         }
     }
 
@@ -149,7 +185,7 @@ impl AgentEngine {
         manifest: SkillManifest,
         executor: Arc<dyn SkillExecutor>,
     ) {
-        self.skills.write().await.insert(
+        self.skills.insert(
             manifest.name.clone(),
             RegisteredSkill {
                 manifest,
@@ -163,7 +199,7 @@ impl AgentEngine {
         manifest: SkillManifest,
         executor: Arc<dyn NativeSkill>,
     ) {
-        self.skills.write().await.insert(
+        self.skills.insert(
             manifest.name.clone(),
             RegisteredSkill {
                 manifest,
@@ -172,26 +208,34 @@ impl AgentEngine {
         );
     }
 
+    pub async fn skill_definitions(&self) -> Vec<SkillDefinition> {
+        let mut definitions = self
+            .skills
+            .iter()
+            .map(|entry| entry.value().definition())
+            .collect::<Vec<_>>();
+        definitions.sort_by(|left, right| left.manifest.name.cmp(&right.manifest.name));
+        definitions
+    }
+
     async fn advance_trigger(&self, request: ProcessRequest) -> Result<AdvanceResult, EngineError> {
         let started_at = SystemTime::now();
         let trigger_id = Uuid::new_v4().to_string();
-        let deadline = Instant::now() + request.policy.max_execution_time();
 
-        if let Some(idempotency_key) = request.idempotency_key.as_deref() {
-            if let Ok(Some(mut prior_outcome)) = self
+        if let Some(idempotency_key) = request.idempotency_key.as_deref()
+            && let Ok(Some(mut prior_outcome)) = self
                 .memory
                 .find_outcome_by_idempotency_key(&request.session_id, idempotency_key)
                 .await
-            {
-                prior_outcome.idempotent_replay = true;
-                counter!("rain_engine.idempotent_replay_total").increment(1);
-                return Ok(AdvanceResult {
-                    outcome: Some(prior_outcome),
-                    emitted_events: Vec::new(),
-                    state_delta: AgentStateDelta::default(),
-                    wake_request: None,
-                });
-            }
+        {
+            prior_outcome.idempotent_replay = true;
+            counter!("rain_engine.idempotent_replay_total").increment(1);
+            return Ok(AdvanceResult {
+                outcome: Some(prior_outcome),
+                emitted_events: Vec::new(),
+                state_delta: AgentStateDelta::default(),
+                wake_request: None,
+            });
         }
 
         let trigger_record = TriggerRecord {
@@ -221,6 +265,11 @@ impl AgentEngine {
                 });
             }
         };
+        let effective_policy = request
+            .policy
+            .clone()
+            .with_overlay(snapshot.active_policy_overlay());
+        let deadline = Instant::now() + effective_policy.max_execution_time();
         let mut context = AgentContext {
             session_id: request.session_id.clone(),
             records: snapshot.records.clone(),
@@ -231,7 +280,7 @@ impl AgentEngine {
                 idempotency_key: request.idempotency_key.clone(),
                 started_at,
                 deadline,
-                policy: request.policy.clone(),
+                policy: effective_policy,
                 provider: request.provider.clone(),
                 cancellation: request.cancellation.clone(),
             },
@@ -392,7 +441,11 @@ impl AgentEngine {
 
         let trigger_id = active_trigger.trigger_id.clone();
         let started_at = SystemTime::now();
-        let deadline = Instant::now() + request.policy.max_execution_time();
+        let effective_policy = request
+            .policy
+            .clone()
+            .with_overlay(snapshot.active_policy_overlay());
+        let deadline = Instant::now() + effective_policy.max_execution_time();
         let context = AgentContext {
             session_id: request.session_id.clone(),
             records: snapshot.records.clone(),
@@ -403,7 +456,7 @@ impl AgentEngine {
                 idempotency_key: active_trigger.idempotency_key.clone(),
                 started_at,
                 deadline,
-                policy: request.policy.clone(),
+                policy: effective_policy,
                 provider: request.provider.clone(),
                 cancellation: request.cancellation.clone(),
             },
@@ -419,6 +472,14 @@ impl AgentEngine {
         .await
     }
 
+    #[instrument(
+        skip(self, context, trigger, emitted_events),
+        fields(
+            session_id = %context.session_id,
+            trigger_id = %context.metadata.trigger_id,
+            step = steps_executed
+        )
+    )]
     async fn perform_single_step(
         &self,
         mut context: AgentContext,
@@ -436,17 +497,16 @@ impl AgentEngine {
 
         let available_skills = self
             .skills
-            .read()
-            .await
-            .values()
+            .iter()
             .filter(|skill| {
                 skill
+                    .value()
                     .manifest
                     .required_scopes
                     .iter()
                     .all(|scope| context.granted_scopes.contains(scope))
             })
-            .map(RegisteredSkill::definition)
+            .map(|skill| skill.value().definition())
             .collect::<Vec<_>>();
 
         let provider_request = ProviderRequest {
@@ -455,7 +515,7 @@ impl AgentEngine {
             available_skills,
             config: context.metadata.provider.clone(),
             policy: context.metadata.policy.clone(),
-            contents: build_provider_contents(&trigger),
+            contents: build_provider_contents(&trigger, &context.records),
         };
         let provider_started = Instant::now();
         let decision = match tokio::time::timeout(
@@ -496,6 +556,7 @@ impl AgentEngine {
         };
         histogram!("rain_engine.provider_latency_seconds")
             .record(provider_started.elapsed().as_secs_f64());
+        counter!("rain_engine.model_decisions_total", "action" => action_metric_label(&decision.action)).increment(1);
 
         self.persist_provider_metadata(&mut context, &decision)
             .await?;
@@ -839,6 +900,16 @@ impl AgentEngine {
         .await
     }
 
+    #[instrument(
+        skip(self, context, calls),
+        fields(
+            session_id = %context.session_id,
+            trigger_id = %context.metadata.trigger_id,
+            step,
+            call_count = calls.len(),
+            max_parallel = context.metadata.policy.max_parallel_skill_calls
+        )
+    )]
     async fn execute_planned_calls(
         &self,
         context: &AgentContext,
@@ -846,12 +917,11 @@ impl AgentEngine {
         calls: Vec<PlannedSkillCall>,
         approval_override: bool,
     ) -> Result<BatchExecution, EngineError> {
-        let registry = self.skills.read().await;
         if !approval_override {
             let approval_calls = calls
                 .iter()
                 .filter_map(|call| {
-                    let skill = registry.get(&call.name)?;
+                    let skill = self.skills.get(&call.name)?;
                     skill
                         .backend
                         .requires_human_approval()
@@ -859,6 +929,7 @@ impl AgentEngine {
                 })
                 .collect::<Vec<_>>();
             if !approval_calls.is_empty() {
+                counter!("rain_engine.approval_suspensions_total").increment(1);
                 return Ok(BatchExecution::Suspended {
                     reason: SuspendReason::HumanApprovalRequired {
                         skill_names: approval_calls,
@@ -873,7 +944,11 @@ impl AgentEngine {
         let mut executable = VecDeque::<PreparedCall>::new();
 
         for call in calls.iter() {
-            let Some(skill) = registry.get(&call.name).cloned() else {
+            let Some(skill) = self
+                .skills
+                .get(&call.name)
+                .map(|entry| entry.value().clone())
+            else {
                 immediate_results.push(error_result(
                     call.call_id.clone(),
                     call.name.clone(),
@@ -922,6 +997,12 @@ impl AgentEngine {
             self.memory
                 .append_tool_call(&context.session_id, call_record.clone())
                 .await?;
+            counter!(
+                "rain_engine.tool_calls_total",
+                "skill" => skill.manifest.name.clone(),
+                "backend" => format!("{:?}", skill.backend.kind())
+            )
+            .increment(1);
 
             let mut manifest = skill.manifest.clone();
             manifest.resource_policy = manifest.effective_resource_policy(&context.metadata.policy);
@@ -934,9 +1015,9 @@ impl AgentEngine {
                 context_snapshot: context.to_snapshot(step),
             });
         }
-        drop(registry);
 
         let max_parallel = context.metadata.policy.max_parallel_skill_calls.max(1);
+        gauge!("rain_engine.registered_skills").set(self.skills.len() as f64);
         let mut join_set = JoinSet::new();
         let mut pending = executable;
         let mut results_by_id = HashMap::<String, ToolResultRecord>::new();
@@ -1013,6 +1094,7 @@ impl AgentEngine {
         context
             .records
             .push(SessionRecord::Outcome(outcome.clone()));
+        self.run_self_improvement(context, &outcome).await?;
         Ok(EngineOutcome {
             trigger_id: outcome.trigger_id,
             stop_reason,
@@ -1023,6 +1105,384 @@ impl AgentEngine {
             resume_token,
         })
     }
+
+    #[instrument(
+        skip(self, context, outcome),
+        fields(
+            session_id = %context.session_id,
+            trigger_id = %context.metadata.trigger_id,
+            stop_reason = ?outcome.stop_reason
+        )
+    )]
+    async fn run_self_improvement(
+        &self,
+        context: &mut AgentContext,
+        outcome: &OutcomeRecord,
+    ) -> Result<(), EngineError> {
+        let policy = context.metadata.policy.self_improvement.clone();
+        if !policy.enabled {
+            return Ok(());
+        }
+
+        counter!("rain_engine.self_improvement_reflections_total").increment(1);
+
+        let observations = reflection_observations(context, outcome);
+        let reflection = ReflectionRecord {
+            reflection_id: format!("reflection-{}", Uuid::new_v4()),
+            created_at: SystemTime::now(),
+            trigger_id: context.metadata.trigger_id.clone(),
+            summary: format!(
+                "Observed {:?} after {} step(s); evaluating future policy and strategy.",
+                outcome.stop_reason, outcome.steps_executed
+            ),
+            observations,
+            confidence: 0.72,
+        };
+        self.memory
+            .append_reflection(&context.session_id, reflection.clone())
+            .await?;
+        context.records.push(SessionRecord::Reflection(reflection));
+
+        for performance in summarize_tool_performance(&context.records) {
+            self.memory
+                .append_tool_performance(&context.session_id, performance.clone())
+                .await?;
+            context
+                .records
+                .push(SessionRecord::ToolPerformance(performance.clone()));
+            if performance.calls > 0 {
+                counter!(
+                    "rain_engine.tool_performance_summaries_total",
+                    "skill" => performance.skill_name.clone()
+                )
+                .increment(1);
+            }
+            if performance.failure_rate > 0.5 {
+                let preference = StrategyPreferenceRecord {
+                    preference_id: format!("strategy-{}", Uuid::new_v4()),
+                    created_at: SystemTime::now(),
+                    skill_name: Some(performance.skill_name.clone()),
+                    preference: "avoid_when_alternatives_exist".to_string(),
+                    reason: format!(
+                        "{} failed in {:.0}% of recent calls",
+                        performance.skill_name,
+                        performance.failure_rate * 100.0
+                    ),
+                    confidence: 0.68,
+                };
+                self.memory
+                    .append_strategy_preference(&context.session_id, preference.clone())
+                    .await?;
+                context
+                    .records
+                    .push(SessionRecord::StrategyPreference(preference));
+            }
+        }
+
+        if terminal_observation_count(&context.records) < policy.min_observations_before_tuning {
+            return Ok(());
+        }
+
+        if let Some(rollback) = maybe_rollback_regression(context, outcome) {
+            self.memory
+                .append_policy_tuning(&context.session_id, rollback.clone())
+                .await?;
+            context.records.push(SessionRecord::PolicyTuning(rollback));
+            counter!("rain_engine.self_improvement_rollbacks_total").increment(1);
+            return Ok(());
+        }
+
+        let Some(tuning) = propose_policy_tuning(context, outcome) else {
+            return Ok(());
+        };
+        match tuning.action {
+            PolicyTuningAction::Applied => {
+                counter!("rain_engine.self_improvement_overlays_applied_total").increment(1)
+            }
+            PolicyTuningAction::RejectedUnsafe => {
+                counter!("rain_engine.self_improvement_rejected_unsafe_total").increment(1)
+            }
+            PolicyTuningAction::Proposed | PolicyTuningAction::RolledBack => {}
+        }
+        self.memory
+            .append_policy_tuning(&context.session_id, tuning.clone())
+            .await?;
+        context.records.push(SessionRecord::PolicyTuning(tuning));
+
+        let profile_patch = ProfilePatchRecord {
+            patch_id: format!("profile-patch-{}", Uuid::new_v4()),
+            created_at: SystemTime::now(),
+            description: "No capability or scope expansion was applied automatically.".to_string(),
+            patch: serde_json::json!({"guardrail": "privilege_expansion_requires_approval"}),
+            requires_approval: false,
+            applied: true,
+        };
+        self.memory
+            .append_profile_patch(&context.session_id, profile_patch.clone())
+            .await?;
+        context
+            .records
+            .push(SessionRecord::ProfilePatch(profile_patch));
+
+        Ok(())
+    }
+}
+
+fn action_metric_label(action: &AgentAction) -> &'static str {
+    match action {
+        AgentAction::Respond { .. } => "respond",
+        AgentAction::CallSkills(_) => "call_skills",
+        AgentAction::Continue { .. } => "continue",
+        AgentAction::Yield { .. } => "yield",
+        AgentAction::Suspend { .. } => "suspend",
+        AgentAction::Delegate { .. } => "delegate",
+    }
+}
+
+fn reflection_observations(context: &AgentContext, outcome: &OutcomeRecord) -> Vec<String> {
+    let tool_results = context
+        .records
+        .iter()
+        .filter(|record| matches!(record, SessionRecord::ToolResult(_)))
+        .count();
+    let failed_tools = context
+        .records
+        .iter()
+        .filter(|record| match record {
+            SessionRecord::ToolResult(result) => result.output.is_err(),
+            _ => false,
+        })
+        .count();
+    let provider_cost = context
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            SessionRecord::ProviderUsage(usage) => Some(usage.estimated_cost_usd),
+            _ => None,
+        })
+        .sum::<f64>();
+
+    vec![
+        format!("terminal_stop_reason={:?}", outcome.stop_reason),
+        format!("steps_executed={}", outcome.steps_executed),
+        format!("tool_results={tool_results}"),
+        format!("failed_tool_results={failed_tools}"),
+        format!("estimated_session_cost_usd={provider_cost:.6}"),
+    ]
+}
+
+fn summarize_tool_performance(records: &[SessionRecord]) -> Vec<ToolPerformanceRecord> {
+    let calls = records
+        .iter()
+        .filter_map(|record| match record {
+            SessionRecord::ToolCall(call) => Some((call.call_id.clone(), call)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut grouped = HashMap::<String, (String, usize, usize, usize)>::new();
+
+    for record in records {
+        let SessionRecord::ToolResult(result) = record else {
+            continue;
+        };
+        let backend = calls
+            .get(&result.call_id)
+            .map(|call| format!("{:?}", call.backend_kind))
+            .unwrap_or_else(|| "unknown".to_string());
+        let entry = grouped
+            .entry(result.skill_name.clone())
+            .or_insert((backend, 0, 0, 0));
+        entry.1 += 1;
+        if result.output.is_ok() {
+            entry.2 += 1;
+        } else {
+            entry.3 += 1;
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(
+            |(skill_name, (backend_kind, calls, successes, failures))| ToolPerformanceRecord {
+                performance_id: format!("tool-performance-{}", Uuid::new_v4()),
+                created_at: SystemTime::now(),
+                skill_name,
+                backend_kind,
+                calls,
+                successes,
+                failures,
+                failure_rate: if calls == 0 {
+                    0.0
+                } else {
+                    failures as f64 / calls as f64
+                },
+            },
+        )
+        .collect()
+}
+
+fn terminal_observation_count(records: &[SessionRecord]) -> usize {
+    records
+        .iter()
+        .filter(|record| matches!(record, SessionRecord::Outcome(_)))
+        .count()
+}
+
+fn maybe_rollback_regression(
+    context: &AgentContext,
+    outcome: &OutcomeRecord,
+) -> Option<PolicyTuningRecord> {
+    if !context
+        .metadata
+        .policy
+        .self_improvement
+        .rollback_on_regression
+    {
+        return None;
+    }
+    if !matches!(
+        outcome.stop_reason,
+        StopReason::ProviderFailure
+            | StopReason::DeadlineExceeded
+            | StopReason::PolicyAborted
+            | StopReason::MaxStepsReached
+    ) {
+        return None;
+    }
+    let active = SessionSnapshot {
+        session_id: context.session_id.clone(),
+        records: context.records.clone(),
+        last_sequence_no: None,
+        latest_outcome: Some(outcome.clone()),
+    }
+    .active_policy_overlay()?;
+
+    let mut projected_policy = context.metadata.policy.clone();
+    projected_policy.self_improvement = context.metadata.policy.self_improvement.clone();
+    Some(PolicyTuningRecord {
+        tuning_id: format!("tuning-{}", Uuid::new_v4()),
+        created_at: SystemTime::now(),
+        overlay: PolicyOverlay {
+            status: PolicyOverlayStatus::RolledBack,
+            reason: format!(
+                "Regression detected after overlay {}; rolling back for future advances.",
+                active.overlay_id
+            ),
+            ..active
+        },
+        action: PolicyTuningAction::RolledBack,
+        prior_policy: context.metadata.policy.clone(),
+        projected_policy,
+    })
+}
+
+fn propose_policy_tuning(
+    context: &AgentContext,
+    outcome: &OutcomeRecord,
+) -> Option<PolicyTuningRecord> {
+    let improvement = &context.metadata.policy.self_improvement;
+    let mut patch = PolicyOverlayPatch::default();
+    let mut reason = None::<String>;
+    let delta = improvement.max_policy_delta_percent.clamp(1.0, 100.0);
+
+    match outcome.stop_reason {
+        StopReason::ProviderFailure
+            if outcome
+                .detail
+                .as_deref()
+                .map(|detail| detail.to_ascii_lowercase().contains("timeout"))
+                .unwrap_or(false) =>
+        {
+            patch.provider_timeout_ms = Some(increase_by_percent(
+                context.metadata.policy.provider_timeout_ms,
+                delta,
+            ));
+            reason = Some(
+                "Provider timed out; increasing provider timeout within guardrails.".to_string(),
+            );
+        }
+        StopReason::MaxStepsReached => {
+            patch.max_steps = Some(increase_usize_by_percent(
+                context.metadata.policy.max_steps,
+                delta,
+            ));
+            reason = Some(
+                "Session hit max steps; increasing future step budget within guardrails."
+                    .to_string(),
+            );
+        }
+        StopReason::DeadlineExceeded => {
+            patch.max_execution_time_ms = Some(increase_by_percent(
+                context.metadata.policy.max_execution_time_ms,
+                delta,
+            ));
+            reason = Some("Execution deadline was reached; increasing future wall-clock budget within guardrails.".to_string());
+        }
+        StopReason::PolicyAborted
+            if outcome
+                .detail
+                .as_deref()
+                .map(|detail| detail.contains("cost"))
+                .unwrap_or(false) =>
+        {
+            reason = Some(
+                "Cost limit was reached; automatic cost-limit increases are blocked.".to_string(),
+            );
+        }
+        _ => {}
+    }
+
+    let reason = reason?;
+    let mut overlay = PolicyOverlay {
+        overlay_id: format!("overlay-{}", Uuid::new_v4()),
+        created_at: SystemTime::now(),
+        status: match improvement.mode {
+            SelfImprovementMode::Advisory => PolicyOverlayStatus::Proposed,
+            SelfImprovementMode::AutoWithGuardrails => PolicyOverlayStatus::Applied,
+        },
+        reason,
+        evidence_window_records: context.records.len(),
+        patch,
+        confidence: 0.74,
+        rollback_condition:
+            "Rollback if the next terminal outcome regresses to a policy/provider failure."
+                .to_string(),
+    };
+
+    let action = if outcome
+        .detail
+        .as_deref()
+        .map(|detail| detail.contains("cost"))
+        .unwrap_or(false)
+    {
+        overlay.status = PolicyOverlayStatus::Rejected;
+        PolicyTuningAction::RejectedUnsafe
+    } else {
+        match improvement.mode {
+            SelfImprovementMode::Advisory => PolicyTuningAction::Proposed,
+            SelfImprovementMode::AutoWithGuardrails => PolicyTuningAction::Applied,
+        }
+    };
+
+    let mut projected_policy = context.metadata.policy.clone();
+    overlay.apply_to(&mut projected_policy);
+
+    Some(PolicyTuningRecord {
+        tuning_id: format!("tuning-{}", Uuid::new_v4()),
+        created_at: SystemTime::now(),
+        overlay,
+        action,
+        prior_policy: context.metadata.policy.clone(),
+        projected_policy,
+    })
+}
+
+fn increase_by_percent(value: u64, percent: f64) -> u64 {
+    ((value.max(1) as f64) * (1.0 + percent / 100.0)).ceil() as u64
+}
+
+fn increase_usize_by_percent(value: usize, percent: f64) -> usize {
+    ((value.max(1) as f64) * (1.0 + percent / 100.0)).ceil() as usize
 }
 
 struct PreparedCall {
@@ -1307,7 +1767,59 @@ fn derive_trigger_kernel_events(
     events
 }
 
-fn build_provider_contents(trigger: &AgentTrigger) -> Vec<ProviderMessage> {
+fn build_provider_contents(
+    trigger: &AgentTrigger,
+    history: &[SessionRecord],
+) -> Vec<ProviderMessage> {
+    let mut messages = Vec::new();
+
+    // Map history to messages to provide multi-turn memory
+    for record in history {
+        match record {
+            SessionRecord::Trigger(t) => {
+                messages.push(ProviderMessage {
+                    role: ProviderRole::User,
+                    parts: build_trigger_parts(&t.trigger),
+                });
+            }
+            SessionRecord::ModelDecision(d) => match &d.action {
+                AgentAction::Respond { content } => {
+                    messages.push(ProviderMessage {
+                        role: ProviderRole::Assistant,
+                        parts: vec![ProviderContentPart::Text(content.clone())],
+                    });
+                }
+                AgentAction::CallSkills(calls) => {
+                    // Represent tool calls in history
+                    messages.push(ProviderMessage {
+                        role: ProviderRole::Assistant,
+                        parts: vec![ProviderContentPart::Json(
+                            serde_json::to_value(calls).unwrap_or_default(),
+                        )],
+                    });
+                }
+                _ => {}
+            },
+            SessionRecord::ToolResult(r) => {
+                messages.push(ProviderMessage {
+                    role: ProviderRole::Tool,
+                    parts: vec![ProviderContentPart::ToolResult(r.clone())],
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Add the current trigger that kicked off this step
+    messages.push(ProviderMessage {
+        role: ProviderRole::User,
+        parts: build_trigger_parts(trigger),
+    });
+
+    messages
+}
+
+fn build_trigger_parts(trigger: &AgentTrigger) -> Vec<ProviderContentPart> {
     let mut parts = Vec::new();
     match trigger {
         AgentTrigger::ExternalEvent {
@@ -1453,10 +1965,7 @@ fn build_provider_contents(trigger: &AgentTrigger) -> Vec<ProviderMessage> {
             parts.push(ProviderContentPart::Json(metadata.clone()));
         }
     }
-    vec![ProviderMessage {
-        role: ProviderRole::User,
-        parts,
-    }]
+    parts
 }
 
 fn storage_failure_outcome(
@@ -1480,10 +1989,10 @@ fn storage_failure_outcome(
 mod tests {
     use super::*;
     use crate::{
-        AttachmentRef, InMemoryMemoryStore, MockLlmProvider, ProviderCacheRecord, ProviderDecision,
-        ProviderError, ProviderErrorKind, ProviderUsageRecord, RecordPageQuery, ResourcePolicy,
-        SessionListQuery, SessionSnapshot, SkillCapability, StopReason, TaskId, TaskRecord,
-        TaskStatus,
+        AttachmentRef, EnginePolicy, InMemoryMemoryStore, MockLlmProvider, ProviderCacheRecord,
+        ProviderDecision, ProviderError, ProviderErrorKind, ProviderUsageRecord, RecordPageQuery,
+        ResourcePolicy, SessionListQuery, SessionSnapshot, SkillCapability, StopReason, TaskId,
+        TaskRecord, TaskStatus,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -1952,6 +2461,161 @@ mod tests {
         .expect("outcome");
 
         assert_eq!(outcome.stop_reason, StopReason::ProviderFailure);
+    }
+
+    #[tokio::test]
+    async fn self_improvement_applies_bounded_max_step_overlay() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let llm = Arc::new(MockLlmProvider::scripted(vec![AgentAction::Respond {
+            content: "unused".to_string(),
+        }]));
+        let engine = AgentEngine::new(llm, store.clone());
+        let mut policy = EnginePolicy {
+            max_steps: 0,
+            ..EnginePolicy::default()
+        };
+        policy.self_improvement.min_observations_before_tuning = 1;
+        policy.self_improvement.max_policy_delta_percent = 50.0;
+
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new("learning-max-steps", message_trigger("continue"))
+                .with_policy(policy),
+        )
+        .await
+        .expect("outcome");
+
+        assert_eq!(outcome.stop_reason, StopReason::MaxStepsReached);
+        let snapshot = session(&store, "learning-max-steps").await;
+        let overlay = snapshot.active_policy_overlay().expect("active overlay");
+        assert_eq!(overlay.patch.max_steps, Some(2));
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .any(|record| matches!(record, SessionRecord::Reflection(_)))
+        );
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .any(|record| matches!(record, SessionRecord::PolicyTuning(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn self_improvement_rolls_back_overlay_after_regression() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let llm = Arc::new(MockLlmProvider::dynamic(|_| {
+            Err(ProviderError::new(
+                ProviderErrorKind::Transport,
+                "upstream unavailable",
+                true,
+            ))
+        }));
+        let engine = AgentEngine::new(llm, store.clone());
+        let mut policy = EnginePolicy {
+            max_steps: 0,
+            ..EnginePolicy::default()
+        };
+        policy.self_improvement.min_observations_before_tuning = 1;
+
+        let first = run_until_terminal(
+            &engine,
+            ProcessRequest::new("learning-rollback", message_trigger("first"))
+                .with_policy(policy.clone()),
+        )
+        .await
+        .expect("first");
+        assert_eq!(first.stop_reason, StopReason::MaxStepsReached);
+        assert!(
+            session(&store, "learning-rollback")
+                .await
+                .active_policy_overlay()
+                .is_some()
+        );
+
+        let second = run_until_terminal(
+            &engine,
+            ProcessRequest::new("learning-rollback", message_trigger("second")).with_policy(policy),
+        )
+        .await
+        .expect("second");
+        assert_eq!(second.stop_reason, StopReason::ProviderFailure);
+
+        let snapshot = session(&store, "learning-rollback").await;
+        assert!(snapshot.active_policy_overlay().is_none());
+        assert!(snapshot.records.iter().any(|record| matches!(
+            record,
+            SessionRecord::PolicyTuning(tuning)
+                if tuning.action == PolicyTuningAction::RolledBack
+        )));
+    }
+
+    #[tokio::test]
+    async fn self_improvement_records_tool_performance_and_strategy_preferences() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let llm = Arc::new(MockLlmProvider::dynamic(|input| {
+            if input.context.prior_tool_results.is_empty() {
+                Ok(ProviderDecision {
+                    action: AgentAction::CallSkills(vec![PlannedSkillCall {
+                        call_id: "unstable-call".to_string(),
+                        name: "unstable".to_string(),
+                        args: json!({}),
+                    }]),
+                    usage: None,
+                    cache: None,
+                })
+            } else {
+                Ok(ProviderDecision {
+                    action: AgentAction::Respond {
+                        content: "finished".to_string(),
+                    },
+                    usage: None,
+                    cache: None,
+                })
+            }
+        }));
+        let engine = AgentEngine::new(llm, store.clone());
+        engine
+            .register_wasm_skill(
+                manifest("unstable", &["tool:run"]),
+                Arc::new(StubSkillExecutor {
+                    name: "unstable",
+                    responder: Arc::new(|_| {
+                        Err(SkillExecutionError::new(
+                            SkillFailureKind::Internal,
+                            "simulated failure",
+                        ))
+                    }),
+                }),
+            )
+            .await;
+
+        let mut policy = EnginePolicy::default();
+        policy.self_improvement.min_observations_before_tuning = 1;
+
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new("learning-tools", message_trigger("run"))
+                .with_scope("tool:run")
+                .with_policy(policy),
+        )
+        .await
+        .expect("outcome");
+        assert_eq!(outcome.stop_reason, StopReason::Responded);
+
+        let snapshot = session(&store, "learning-tools").await;
+        assert!(snapshot.records.iter().any(|record| matches!(
+            record,
+            SessionRecord::ToolPerformance(performance)
+                if performance.skill_name == "unstable" && performance.failures >= 1
+        )));
+        assert!(snapshot.records.iter().any(|record| matches!(
+            record,
+            SessionRecord::StrategyPreference(preference)
+                if preference.skill_name.as_deref() == Some("unstable")
+        )));
     }
 
     #[tokio::test]

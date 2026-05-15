@@ -121,7 +121,7 @@ impl GeminiProvider {
     async fn create_cached_content(
         &self,
         model: &str,
-        tool_definitions: &[GeminiToolDefinition],
+        tools: &[GeminiToolEnvelope],
         stable_contents: &[GeminiContent],
         token_count: usize,
     ) -> Result<ProviderCacheRecord, ProviderError> {
@@ -135,7 +135,7 @@ impl GeminiProvider {
                 "systemInstruction": {
                     "parts": [{ "text": self.config.system_instruction }]
                 },
-                "tools": tool_definitions,
+                "tools": tools,
                 "contents": stable_contents,
             }))
             .send()
@@ -204,14 +204,15 @@ impl LlmProvider for GeminiProvider {
         } else {
             let token_count = self.count_tokens(&model, &active_contents).await?;
             if token_count > input.policy.cache_threshold_tokens {
-                let stable_contents = collect_stable_contents(&input);
+                // Stable content for caching is the entire history EXCEPT the latest user prompt
+                let stable_contents = if active_contents.len() > 1 {
+                    active_contents[..active_contents.len() - 1].to_vec()
+                } else {
+                    active_contents.clone()
+                };
+
                 let created = self
-                    .create_cached_content(
-                        &model,
-                        &tools[0].function_declarations,
-                        &stable_contents,
-                        token_count,
-                    )
+                    .create_cached_content(&model, &tools, &stable_contents, token_count)
                     .await?;
                 let id = created.cached_content_id.clone();
                 cache_record = Some(created);
@@ -222,10 +223,16 @@ impl LlmProvider for GeminiProvider {
         };
 
         let request_body = if let Some(cached_content) = &cached_content {
+            // When using a cache, Gemini expects only the NEW turns in the 'contents' array.
+            // Tools and System Instruction are already in the cache and MUST NOT be sent.
+            let suffix = if !active_contents.is_empty() {
+                vec![active_contents.last().unwrap().clone()]
+            } else {
+                vec![]
+            };
             json!({
                 "cachedContent": cached_content,
-                "contents": active_contents,
-                "tools": tools,
+                "contents": suffix,
             })
         } else {
             json!({
@@ -255,8 +262,16 @@ impl LlmProvider for GeminiProvider {
             return Err(classify_status(status, body));
         }
 
-        let body: GenerateContentResponse = response.json().await.map_err(|err| {
-            ProviderError::new(ProviderErrorKind::InvalidResponse, err.to_string(), false)
+        let raw_text = response.text().await.map_err(|err| {
+            ProviderError::new(ProviderErrorKind::Transport, err.to_string(), true)
+        })?;
+        let body: GenerateContentResponse = serde_json::from_str(&raw_text).map_err(|err| {
+            tracing::error!("Gemini response deserialization failed: {err}\nRaw body: {raw_text}");
+            ProviderError::new(
+                ProviderErrorKind::InvalidResponse,
+                format!("error decoding response body: {err}"),
+                false,
+            )
         })?;
         let candidate = body.candidates.into_iter().next().ok_or_else(|| {
             ProviderError::new(
@@ -265,10 +280,22 @@ impl LlmProvider for GeminiProvider {
                 false,
             )
         })?;
+        let content = candidate.content.ok_or_else(|| {
+            let reason = candidate.finish_reason.unwrap_or_else(|| "unknown".into());
+            ProviderError::new(
+                ProviderErrorKind::InvalidResponse,
+                format!("candidate blocked by provider (reason: {reason})"),
+                false,
+            )
+        })?;
 
         let mut calls = Vec::new();
         let mut text_parts = Vec::new();
-        for (index, part) in candidate.content.parts.into_iter().enumerate() {
+        for (index, part) in content.parts.into_iter().enumerate() {
+            // Skip internal thinking/reasoning parts from Gemini 2.5+ models
+            if part.thought == Some(true) {
+                continue;
+            }
             if let Some(function_call) = part.function_call {
                 calls.push(PlannedSkillCall {
                     call_id: function_call
@@ -333,14 +360,42 @@ fn map_provider_contents(contents: &[rain_engine_core::ProviderMessage]) -> Vec<
             parts: message
                 .parts
                 .iter()
-                .flat_map(map_provider_part)
+                .flat_map(|part| map_provider_part_with_role(part, &message.role))
                 .collect::<Vec<_>>(),
         })
         .collect()
 }
 
-fn map_provider_part(part: &ProviderContentPart) -> Vec<GeminiPart> {
+fn map_provider_part_with_role(
+    part: &ProviderContentPart,
+    role: &rain_engine_core::ProviderRole,
+) -> Vec<GeminiPart> {
     match part {
+        ProviderContentPart::Json(value) if *role == rain_engine_core::ProviderRole::Assistant => {
+            if let Ok(calls) = serde_json::from_value::<Vec<PlannedSkillCall>>(value.clone()) {
+                return calls
+                    .into_iter()
+                    .map(|c| GeminiPart {
+                        text: None,
+                        inline_data: None,
+                        file_data: None,
+                        function_call: Some(FunctionCall {
+                            id: Some(c.call_id),
+                            name: c.name,
+                            args: Some(c.args),
+                        }),
+                        function_response: None,
+                    })
+                    .collect();
+            }
+            vec![GeminiPart {
+                text: Some(value.to_string()),
+                inline_data: None,
+                file_data: None,
+                function_call: None,
+                function_response: None,
+            }]
+        }
         ProviderContentPart::Text(text) => vec![GeminiPart {
             text: Some(text.clone()),
             inline_data: None,
@@ -375,7 +430,10 @@ fn map_provider_part(part: &ProviderContentPart) -> Vec<GeminiPart> {
                 name: result.skill_name.clone(),
                 response: json!({
                     "call_id": result.call_id,
-                    "output": result.output,
+                    "output": result.output.as_ref().map_or_else(
+                        |err| json!({ "error": err.message }),
+                        truncate_tool_output,
+                    ),
                 }),
             }),
         }],
@@ -407,32 +465,24 @@ fn map_attachment_part(attachment: &AttachmentRef) -> GeminiPart {
     }
 }
 
-fn collect_stable_contents(input: &ProviderRequest) -> Vec<GeminiContent> {
-    let mut parts = Vec::new();
-    for record in &input.context.history {
-        if let SessionRecord::ToolResult(result) = record {
-            parts.push(GeminiPart {
-                text: None,
-                inline_data: None,
-                file_data: None,
-                function_call: None,
-                function_response: Some(FunctionResponse {
-                    name: result.skill_name.clone(),
-                    response: json!({
-                        "call_id": result.call_id,
-                        "output": result.output,
-                    }),
-                }),
-            });
+fn truncate_tool_output(value: &Value) -> Value {
+    match value {
+        Value::String(s) if s.len() > 65536 => {
+            json!(format!(
+                "{}... [TRUNCATED {} bytes for token efficiency]",
+                &s[..65536],
+                s.len() - 65536
+            ))
         }
-    }
-    if parts.is_empty() {
-        map_provider_contents(&input.contents)
-    } else {
-        vec![GeminiContent {
-            role: "user".to_string(),
-            parts,
-        }]
+        Value::Object(map) => {
+            let mut new_map = serde_json::Map::new();
+            for (k, v) in map {
+                new_map.insert(k.clone(), truncate_tool_output(v));
+            }
+            Value::Object(new_map)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(truncate_tool_output).collect()),
+        _ => value.clone(),
     }
 }
 
@@ -519,28 +569,41 @@ struct CreateCachedContentResponse {
     name: String,
 }
 
+/// Tolerant of extra fields returned by Gemini 2.5+ and 3.x models
+/// (e.g. modelVersion, responseId, promptFeedback, etc.)
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GenerateContentResponse {
+    #[serde(default)]
     candidates: Vec<GenerateCandidate>,
-    #[serde(rename = "usageMetadata")]
+    #[serde(default)]
     usage_metadata: Option<UsageMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GenerateCandidate {
-    content: GenerateContent,
+    /// Content may be absent when the candidate is blocked by safety filters
+    content: Option<GenerateContent>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GenerateContent {
+    #[serde(default)]
     parts: Vec<GeneratePart>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GeneratePart {
     text: Option<String>,
-    #[serde(rename = "functionCall")]
     function_call: Option<FunctionCall>,
+    /// Gemini 2.5+ "thinking" models include a `thought` flag on internal
+    /// reasoning parts — we capture it so we can skip those parts.
+    #[serde(default)]
+    thought: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -550,12 +613,21 @@ struct FunctionCall {
     args: Option<Value>,
 }
 
+/// Usage metadata — all fields optional and defaulted to 0 because field
+/// names and availability vary across Gemini model generations.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UsageMetadata {
-    #[serde(rename = "promptTokenCount")]
+    #[serde(default)]
     prompt_token_count: u64,
-    #[serde(rename = "candidatesTokenCount")]
+    #[serde(default)]
     candidates_token_count: u64,
+    #[serde(default)]
+    total_token_count: Option<u64>,
+    /// Gemini 2.5+ thinking models report thought tokens separately
+    #[serde(default)]
+    thoughts_token_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

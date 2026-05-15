@@ -1,0 +1,10 @@
+[typescript]
+
+[typescript.type_mappings]
+"SystemTime" = "string"
+"usize" = "number"
+"Value" = "any"
+"Duration" = "number"
+"Instant" = "string"
+"u64" = "number"
+"i64" = "number"

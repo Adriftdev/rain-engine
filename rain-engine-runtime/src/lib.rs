@@ -6,17 +6,20 @@
 use axum::{
     Json, Router,
     body::to_bytes,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header::CONTENT_TYPE},
-    routing::post,
+    response::sse::{Event, KeepAlive, Sse},
+    routing::{get, post},
 };
 use futures_util::stream;
 use rain_engine_blob::{BlobBackendConfig, build_blob_store};
 use rain_engine_core::{
-    AdvanceRequest, AgentEngine, AgentTrigger, ApprovalDecision, AttachmentRef, BlobStore,
-    ContinueRequest, CorrelationId, EngineError, EngineOutcome, EnginePolicy, InMemoryMemoryStore,
-    LlmProvider, MemoryStore, MockLlmProvider, MultimodalPayload, ProcessRequest,
-    ProviderRequestConfig, WakeId,
+    AdvanceRequest, AgentEngine, AgentStateSnapshot, AgentTrigger, ApprovalDecision, AttachmentRef,
+    BlobStore, ContinueRequest, CorrelationId, EngineError, EngineOutcome, EnginePolicy,
+    InMemoryMemoryStore, LlmProvider, MemoryStore, MockLlmProvider, MultimodalPayload,
+    PendingApprovalRecord, ProcessRequest, ProviderRequestConfig, RecordPageQuery,
+    SessionListQuery, SessionRecord, SessionSnapshot, SkillDefinition, StopReason, ToolCallRecord,
+    ToolResultRecord, WakeId, unix_time_ms,
 };
 use rain_engine_openai::{OpenAiCompatibleConfig, OpenAiCompatibleProvider};
 use rain_engine_provider_gemini::{GeminiAuth, GeminiConfig, GeminiProvider};
@@ -24,7 +27,7 @@ use rain_engine_store_pg::PgMemoryStore;
 use rain_engine_store_sqlite::SqliteMemoryStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +36,7 @@ use uuid::Uuid;
 
 const MAX_INGRESS_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WebhookIngressRequest {
     pub session_id: String,
@@ -49,6 +53,7 @@ pub struct WebhookIngressRequest {
     pub policy_override: Option<EnginePolicy>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApprovalIngressRequest {
     pub session_id: String,
@@ -64,6 +69,7 @@ pub struct ApprovalIngressRequest {
     pub policy_override: Option<EnginePolicy>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EventIngressRequest {
     pub session_id: String,
@@ -80,6 +86,7 @@ pub struct EventIngressRequest {
     pub policy_override: Option<EnginePolicy>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HumanInputIngressRequest {
     pub session_id: String,
@@ -96,6 +103,7 @@ pub struct HumanInputIngressRequest {
     pub policy_override: Option<EnginePolicy>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScheduledWakeIngressRequest {
     pub session_id: String,
@@ -110,6 +118,7 @@ pub struct ScheduledWakeIngressRequest {
     pub policy_override: Option<EnginePolicy>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DelegationResultIngressRequest {
     pub session_id: String,
@@ -125,6 +134,7 @@ pub struct DelegationResultIngressRequest {
     pub policy_override: Option<EnginePolicy>,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeServerConfig {
     pub bind_address: SocketAddr,
@@ -135,6 +145,7 @@ pub struct RuntimeServerConfig {
     pub default_provider: ProviderRequestConfig,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StoreBootstrapConfig {
@@ -145,6 +156,7 @@ pub enum StoreBootstrapConfig {
 
 pub type BlobBootstrapConfig = BlobBackendConfig;
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum GeminiAuthMode {
@@ -152,6 +164,7 @@ pub enum GeminiAuthMode {
     BearerToken,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderBootstrapConfig {
@@ -197,6 +210,7 @@ fn default_gemini_provider_name() -> String {
     "gemini".to_string()
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeBootstrapConfig {
     pub server: RuntimeServerConfig,
@@ -211,12 +225,144 @@ pub struct RuntimeState {
     memory: Arc<dyn MemoryStore>,
     blob_store: Arc<dyn BlobStore>,
     config: RuntimeServerConfig,
+    provider_kind: String,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeRunResult {
     pub advances: Vec<rain_engine_core::AdvanceResult>,
     pub outcome: EngineOutcome,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Empty,
+    Running,
+    Completed,
+    Suspended,
+    Delegated,
+    Stopped,
+    Failed,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalView {
+    pub resume_token: String,
+    pub created_at_ms: i64,
+    pub trigger_id: String,
+    pub step: usize,
+    pub reason: String,
+    pub pending_calls: Vec<rain_engine_core::PlannedSkillCall>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolTimelineItem {
+    pub call_id: String,
+    pub skill_name: String,
+    pub step: usize,
+    pub called_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub backend_kind: String,
+    pub args: Value,
+    pub success: Option<bool>,
+    pub output_preview: Option<String>,
+    pub failure_kind: Option<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SelfImprovementView {
+    pub active_overlay: Option<rain_engine_core::PolicyOverlay>,
+    pub reflections: Vec<rain_engine_core::ReflectionRecord>,
+    pub policy_tunings: Vec<rain_engine_core::PolicyTuningRecord>,
+    pub strategy_preferences: Vec<rain_engine_core::StrategyPreferenceRecord>,
+    pub tool_performance: Vec<rain_engine_core::ToolPerformanceRecord>,
+    pub profile_patches: Vec<rain_engine_core::ProfilePatchRecord>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
+pub enum TimelineItem {
+    HumanInput {
+        actor_id: String,
+        content: String,
+        occurred_at_ms: i64,
+    },
+    AssistantResponse {
+        content: String,
+        stop_reason: StopReason,
+        occurred_at_ms: i64,
+    },
+    ToolCall {
+        call_id: String,
+        skill_name: String,
+        formatted_call: String,
+        occurred_at_ms: i64,
+    },
+    ToolResult {
+        call_id: String,
+        skill_name: String,
+        success: bool,
+        preview: String,
+        occurred_at_ms: i64,
+    },
+    ApprovalRequested {
+        resume_token: String,
+        pending_calls: Vec<rain_engine_core::PlannedSkillCall>,
+        occurred_at_ms: i64,
+    },
+    ApprovalResolved {
+        resume_token: String,
+        decision: ApprovalDecision,
+        occurred_at_ms: i64,
+    },
+    Learning {
+        label: String,
+        detail: String,
+        confidence: f64,
+        occurred_at_ms: i64,
+    },
+    System {
+        label: String,
+        detail: String,
+        occurred_at_ms: i64,
+    },
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionView {
+    pub session_id: String,
+    pub status: SessionStatus,
+    pub last_sequence_no: Option<i64>,
+    pub latest_outcome: Option<rain_engine_core::OutcomeRecord>,
+    pub pending_approval: Option<ApprovalView>,
+    pub state: AgentStateSnapshot,
+    pub timeline: Vec<TimelineItem>,
+    pub tool_timeline: Vec<ToolTimelineItem>,
+    pub self_improvement: SelfImprovementView,
+    pub record_count: usize,
+    pub total_estimated_cost_usd: f64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeCapabilities {
+    pub version: String,
+    pub provider_kind: String,
+    pub default_model: Option<String>,
+    pub streaming: bool,
+    pub approvals: bool,
+    pub multipart_uploads: bool,
+    pub default_scopes: Vec<String>,
+    pub default_policy: EnginePolicy,
+    pub skills: Vec<SkillDefinition>,
 }
 
 impl RuntimeState {
@@ -231,7 +377,13 @@ impl RuntimeState {
             memory,
             blob_store,
             config,
+            provider_kind: "custom".to_string(),
         }
+    }
+
+    pub fn with_provider_kind(mut self, provider_kind: impl Into<String>) -> Self {
+        self.provider_kind = provider_kind.into();
+        self
     }
 
     pub fn engine(&self) -> &AgentEngine {
@@ -266,6 +418,13 @@ enum IngressError {
 pub async fn build_runtime_state(
     config: RuntimeBootstrapConfig,
 ) -> Result<RuntimeState, RuntimeConfigError> {
+    let provider_kind = match &config.provider {
+        ProviderBootstrapConfig::Mock { .. } => "mock",
+        ProviderBootstrapConfig::OpenAiCompatible { .. } => "openai_compatible",
+        ProviderBootstrapConfig::Gemini { .. } => "gemini",
+    }
+    .to_string();
+
     let memory: Arc<dyn MemoryStore> = match &config.store {
         StoreBootstrapConfig::InMemory => Arc::new(InMemoryMemoryStore::new()),
         StoreBootstrapConfig::Sqlite { database_url } => {
@@ -356,11 +515,13 @@ pub async fn build_runtime_state(
         memory,
         blob_store,
         config.server,
-    ))
+    )
+    .with_provider_kind(provider_kind))
 }
 
 pub fn app(state: RuntimeState) -> Router {
     Router::new()
+        // Trigger (write) routes
         .route("/triggers/webhook/{source}", post(handle_webhook))
         .route("/triggers/external/{source}", post(handle_external_event))
         .route("/triggers/human/{actor_id}", post(handle_human_input))
@@ -371,6 +532,15 @@ pub fn app(state: RuntimeState) -> Router {
             "/triggers/delegation-result",
             post(handle_delegation_result),
         )
+        // Read routes
+        .route("/health", get(handle_health))
+        .route("/capabilities", get(handle_capabilities))
+        .route("/sessions", get(handle_list_sessions))
+        .route("/sessions/{session_id}", get(handle_get_session))
+        .route("/sessions/{session_id}/view", get(handle_get_session_view))
+        .route("/sessions/{session_id}/records", get(handle_list_records))
+        // SSE streaming
+        .route("/sessions/{session_id}/stream", get(handle_sse_stream))
         .with_state(state)
 }
 
@@ -759,8 +929,13 @@ fn effective_provider(
 
 async fn run_process_request(
     state: &RuntimeState,
-    request: ProcessRequest,
+    mut request: ProcessRequest,
 ) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
+    // Default scopes for simple ingress if none provided
+    if request.granted_scopes.is_empty() {
+        request.granted_scopes.insert("tool:run".to_string());
+    }
+
     let timeout = Duration::from_millis(state.config.request_timeout_ms.max(1));
     match tokio::time::timeout(timeout, run_until_terminal_trace(&state.engine, request)).await {
         Ok(Ok(result)) => Ok(Json(result)),
@@ -807,6 +982,507 @@ fn map_ingress_error(error: IngressError) -> (StatusCode, String) {
         IngressError::Malformed(_) => (StatusCode::BAD_REQUEST, error.to_string()),
         IngressError::Blob(_) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Read handlers
+// ---------------------------------------------------------------------------
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub version: String,
+}
+
+async fn handle_health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+async fn handle_capabilities(State(state): State<RuntimeState>) -> Json<RuntimeCapabilities> {
+    Json(RuntimeCapabilities {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        provider_kind: state.provider_kind.clone(),
+        default_model: state.config.default_provider.model.clone(),
+        streaming: true,
+        approvals: true,
+        multipart_uploads: true,
+        default_scopes: vec!["tool:run".to_string()],
+        default_policy: state.config.default_policy.clone(),
+        skills: state.engine.skill_definitions().await,
+    })
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionListParams {
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+    #[serde(default)]
+    pub until_ms: Option<i64>,
+}
+
+async fn handle_list_sessions(
+    State(state): State<RuntimeState>,
+    Query(params): Query<SessionListParams>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let query = SessionListQuery {
+        offset: params.offset.unwrap_or(0),
+        limit: params.limit.unwrap_or(100),
+        since_ms: params.since_ms,
+        until_ms: params.until_ms,
+    };
+    let sessions = state
+        .memory
+        .list_sessions(query)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+    Ok(Json(serde_json::to_value(sessions).unwrap_or_default()))
+}
+
+async fn handle_get_session(
+    State(state): State<RuntimeState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let snapshot = state
+        .memory
+        .load_session(&session_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+    Ok(Json(serde_json::to_value(snapshot).unwrap_or_default()))
+}
+
+async fn handle_get_session_view(
+    State(state): State<RuntimeState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<SessionView>, (StatusCode, String)> {
+    let snapshot = state
+        .memory
+        .load_session(&session_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+    Ok(Json(build_session_view(snapshot)))
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RecordListParams {
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+    #[serde(default)]
+    pub until_ms: Option<i64>,
+}
+
+async fn handle_list_records(
+    State(state): State<RuntimeState>,
+    Path(session_id): Path<String>,
+    Query(params): Query<RecordListParams>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let query = RecordPageQuery {
+        session_id,
+        offset: params.offset.unwrap_or(0),
+        limit: params.limit.unwrap_or(100),
+        since_ms: params.since_ms,
+        until_ms: params.until_ms,
+    };
+    let page = state
+        .memory
+        .list_records(query)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+    Ok(Json(serde_json::to_value(page).unwrap_or_default()))
+}
+
+fn build_session_view(snapshot: SessionSnapshot) -> SessionView {
+    let state = snapshot.agent_state();
+    let pending_approval = latest_pending_approval(&snapshot);
+    let timeline = build_timeline(&snapshot.records);
+    let tool_timeline = build_tool_timeline(&snapshot.records);
+    let status = derive_session_status(&snapshot, pending_approval.as_ref());
+    let total_estimated_cost_usd = snapshot.total_estimated_cost_usd();
+    let self_improvement = build_self_improvement_view(&snapshot);
+
+    SessionView {
+        session_id: snapshot.session_id,
+        status,
+        last_sequence_no: snapshot.last_sequence_no,
+        latest_outcome: snapshot.latest_outcome,
+        pending_approval,
+        state,
+        timeline,
+        tool_timeline,
+        self_improvement,
+        record_count: snapshot.records.len(),
+        total_estimated_cost_usd,
+    }
+}
+
+fn build_self_improvement_view(snapshot: &SessionSnapshot) -> SelfImprovementView {
+    SelfImprovementView {
+        active_overlay: snapshot.active_policy_overlay(),
+        reflections: snapshot.reflections(),
+        policy_tunings: snapshot.policy_tunings(),
+        strategy_preferences: snapshot.strategy_preferences(),
+        tool_performance: snapshot.tool_performance_records(),
+        profile_patches: snapshot
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::ProfilePatch(patch) => Some(patch.clone()),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+fn derive_session_status(
+    snapshot: &SessionSnapshot,
+    pending_approval: Option<&ApprovalView>,
+) -> SessionStatus {
+    if snapshot.records.is_empty() {
+        return SessionStatus::Empty;
+    }
+
+    if pending_approval.is_some() {
+        return SessionStatus::Suspended;
+    }
+
+    match snapshot
+        .latest_outcome
+        .as_ref()
+        .map(|outcome| &outcome.stop_reason)
+    {
+        None => SessionStatus::Running,
+        Some(StopReason::Responded | StopReason::Yielded) => SessionStatus::Completed,
+        Some(StopReason::Suspended) => SessionStatus::Suspended,
+        Some(StopReason::Delegated) => SessionStatus::Delegated,
+        Some(
+            StopReason::ProviderFailure
+            | StopReason::StorageFailure
+            | StopReason::PolicyAborted
+            | StopReason::DeadlineExceeded
+            | StopReason::Cancelled,
+        ) => SessionStatus::Failed,
+        Some(StopReason::MaxStepsReached) => SessionStatus::Stopped,
+    }
+}
+
+fn latest_pending_approval(snapshot: &SessionSnapshot) -> Option<ApprovalView> {
+    let resolved = snapshot
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            SessionRecord::ApprovalResolution(resolution) => {
+                Some(resolution.resume_token.0.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    let target_token = snapshot
+        .latest_outcome
+        .as_ref()
+        .filter(|outcome| outcome.stop_reason == StopReason::Suspended)
+        .and_then(|outcome| outcome.resume_token.as_ref())
+        .map(|token| token.0.as_str());
+
+    snapshot
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            SessionRecord::PendingApproval(approval)
+                if !resolved.contains(&approval.resume_token.0)
+                    && target_token
+                        .map(|token| token == approval.resume_token.0.as_str())
+                        .unwrap_or(true) =>
+            {
+                Some(approval_view(approval))
+            }
+            _ => None,
+        })
+}
+
+fn approval_view(record: &PendingApprovalRecord) -> ApprovalView {
+    ApprovalView {
+        resume_token: record.resume_token.0.clone(),
+        created_at_ms: unix_time_ms(record.created_at),
+        trigger_id: record.trigger_id.clone(),
+        step: record.step,
+        reason: match &record.reason {
+            rain_engine_core::SuspendReason::HumanApprovalRequired { skill_names } => {
+                format!("Human approval required for {}", skill_names.join(", "))
+            }
+            rain_engine_core::SuspendReason::ProviderRequested { message } => message.clone(),
+        },
+        pending_calls: record.pending_calls.clone(),
+    }
+}
+
+fn build_timeline(records: &[SessionRecord]) -> Vec<TimelineItem> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            SessionRecord::Trigger(trigger) => match &trigger.trigger {
+                AgentTrigger::HumanInput {
+                    actor_id, content, ..
+                } => Some(TimelineItem::HumanInput {
+                    actor_id: actor_id.clone(),
+                    content: content.clone(),
+                    occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                }),
+                AgentTrigger::ExternalEvent { source, .. }
+                | AgentTrigger::Webhook { source, .. }
+                | AgentTrigger::SystemObservation { source, .. } => Some(TimelineItem::System {
+                    label: "event received".to_string(),
+                    detail: source.clone(),
+                    occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                }),
+                AgentTrigger::ScheduledWake { reason, .. } => Some(TimelineItem::System {
+                    label: "scheduled wake".to_string(),
+                    detail: reason.clone(),
+                    occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                }),
+                AgentTrigger::Approval { decision, .. } => Some(TimelineItem::System {
+                    label: "approval submitted".to_string(),
+                    detail: format!("{decision:?}"),
+                    occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                }),
+                AgentTrigger::DelegationResult { correlation_id, .. } => {
+                    Some(TimelineItem::System {
+                        label: "delegation result".to_string(),
+                        detail: correlation_id.0.clone(),
+                        occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                    })
+                }
+                AgentTrigger::RuleTrigger { rule_id, .. } => Some(TimelineItem::System {
+                    label: "rule trigger".to_string(),
+                    detail: rule_id.clone(),
+                    occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                }),
+                AgentTrigger::ProactiveHeartbeat { .. } => Some(TimelineItem::System {
+                    label: "heartbeat".to_string(),
+                    detail: "runtime wake".to_string(),
+                    occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                }),
+                AgentTrigger::Message {
+                    user_id, content, ..
+                } => Some(TimelineItem::HumanInput {
+                    actor_id: user_id.clone(),
+                    content: content.clone(),
+                    occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                }),
+            },
+            SessionRecord::Outcome(outcome) => outcome
+                .response
+                .clone()
+                .or_else(|| outcome.detail.clone())
+                .map(|content| TimelineItem::AssistantResponse {
+                    content,
+                    stop_reason: outcome.stop_reason.clone(),
+                    occurred_at_ms: unix_time_ms(outcome.finished_at),
+                }),
+            SessionRecord::ToolCall(call) => Some(TimelineItem::ToolCall {
+                call_id: call.call_id.clone(),
+                skill_name: call.skill_name.clone(),
+                formatted_call: format_tool_call(&call.skill_name, &call.args),
+                occurred_at_ms: unix_time_ms(call.called_at),
+            }),
+            SessionRecord::ToolResult(result) => {
+                let (success, preview) = tool_result_preview(result);
+                Some(TimelineItem::ToolResult {
+                    call_id: result.call_id.clone(),
+                    skill_name: result.skill_name.clone(),
+                    success,
+                    preview,
+                    occurred_at_ms: unix_time_ms(result.finished_at),
+                })
+            }
+            SessionRecord::PendingApproval(approval) => Some(TimelineItem::ApprovalRequested {
+                resume_token: approval.resume_token.0.clone(),
+                pending_calls: approval.pending_calls.clone(),
+                occurred_at_ms: unix_time_ms(approval.created_at),
+            }),
+            SessionRecord::ApprovalResolution(resolution) => Some(TimelineItem::ApprovalResolved {
+                resume_token: resolution.resume_token.0.clone(),
+                decision: resolution.decision.clone(),
+                occurred_at_ms: unix_time_ms(resolution.resolved_at),
+            }),
+            SessionRecord::Reflection(reflection) => Some(TimelineItem::Learning {
+                label: "reflection".to_string(),
+                detail: reflection.summary.clone(),
+                confidence: reflection.confidence,
+                occurred_at_ms: unix_time_ms(reflection.created_at),
+            }),
+            SessionRecord::PolicyTuning(tuning) => Some(TimelineItem::Learning {
+                label: format!("policy {:?}", tuning.action).to_ascii_lowercase(),
+                detail: tuning.overlay.reason.clone(),
+                confidence: tuning.overlay.confidence,
+                occurred_at_ms: unix_time_ms(tuning.created_at),
+            }),
+            SessionRecord::StrategyPreference(preference) => Some(TimelineItem::Learning {
+                label: "strategy preference".to_string(),
+                detail: preference.reason.clone(),
+                confidence: preference.confidence,
+                occurred_at_ms: unix_time_ms(preference.created_at),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn build_tool_timeline(records: &[SessionRecord]) -> Vec<ToolTimelineItem> {
+    let results = records
+        .iter()
+        .filter_map(|record| match record {
+            SessionRecord::ToolResult(result) => Some((result.call_id.clone(), result)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    records
+        .iter()
+        .filter_map(|record| match record {
+            SessionRecord::ToolCall(call) => Some(tool_timeline_item(
+                call,
+                results.get(&call.call_id).copied(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_timeline_item(
+    call: &ToolCallRecord,
+    result: Option<&ToolResultRecord>,
+) -> ToolTimelineItem {
+    let (success, output_preview, failure_kind, finished_at_ms) = match result {
+        Some(result) => {
+            let (success, preview) = tool_result_preview(result);
+            let failure_kind = match &result.output {
+                Ok(_) => None,
+                Err(error) => Some(format!("{:?}", error.kind)),
+            };
+            (
+                Some(success),
+                Some(preview),
+                failure_kind,
+                Some(unix_time_ms(result.finished_at)),
+            )
+        }
+        None => (None, None, None, None),
+    };
+
+    ToolTimelineItem {
+        call_id: call.call_id.clone(),
+        skill_name: call.skill_name.clone(),
+        step: call.step,
+        called_at_ms: unix_time_ms(call.called_at),
+        finished_at_ms,
+        backend_kind: format!("{:?}", call.backend_kind),
+        args: call.args.clone(),
+        success,
+        output_preview,
+        failure_kind,
+    }
+}
+
+fn tool_result_preview(result: &ToolResultRecord) -> (bool, String) {
+    match &result.output {
+        Ok(value) => (true, preview_value(value)),
+        Err(error) => (false, error.message.clone()),
+    }
+}
+
+fn preview_value(value: &Value) -> String {
+    if let Some(stdout) = value.get("stdout").and_then(Value::as_str) {
+        return truncate_preview(stdout);
+    }
+    if let Some(content) = value.get("content").and_then(Value::as_str) {
+        return truncate_preview(content);
+    }
+    if let Some(text) = value.as_str() {
+        return truncate_preview(text);
+    }
+    truncate_preview(&serde_json::to_string(value).unwrap_or_else(|_| "<unprintable>".to_string()))
+}
+
+fn truncate_preview(value: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 240;
+    let mut preview = value
+        .trim()
+        .chars()
+        .take(MAX_PREVIEW_CHARS)
+        .collect::<String>();
+    if value.trim().chars().count() > MAX_PREVIEW_CHARS {
+        preview.push('…');
+    }
+    preview
+}
+
+fn format_tool_call(name: &str, args: &Value) -> String {
+    match args {
+        Value::Object(map) if map.is_empty() => format!("{name}()"),
+        Value::Object(map) => {
+            let rendered = map
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", preview_value(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name}({rendered})")
+        }
+        other => format!("{name}({})", preview_value(other)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE streaming
+// ---------------------------------------------------------------------------
+
+async fn handle_sse_stream(
+    State(state): State<RuntimeState>,
+    Path(session_id): Path<String>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let memory = state.memory.clone();
+    let mut last_seq: Option<i64> = None;
+
+    let stream = async_stream::stream! {
+        loop {
+            let snapshot = match memory.load_session(&session_id).await {
+                Ok(snap) => snap,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            let current_seq = snapshot.last_sequence_no;
+            if current_seq != last_seq {
+                last_seq = current_seq;
+                if let Ok(json) = serde_json::to_string(&build_session_view(snapshot.clone())) {
+                    yield Ok(Event::default().event("session_view").data(json));
+                }
+                if let Ok(json) = serde_json::to_string(&snapshot.records) {
+                    yield Ok(Event::default().event("records").data(json));
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 #[cfg(test)]
@@ -900,6 +1576,85 @@ mod tests {
         assert_eq!(run.outcome.stop_reason, StopReason::Responded);
         assert_eq!(run.outcome.response.as_deref(), Some("processed"));
         assert!(!run.advances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capabilities_route_exposes_runtime_surface() {
+        let state = runtime_state_with_mock("processed");
+
+        let response = app(state)
+            .oneshot(
+                Request::get("/capabilities")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let capabilities: RuntimeCapabilities =
+            serde_json::from_slice(&bytes).expect("capabilities");
+        assert!(capabilities.streaming);
+        assert!(capabilities.approvals);
+        assert!(
+            capabilities
+                .default_scopes
+                .contains(&"tool:run".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn session_view_projects_records_for_control_room() {
+        let state = runtime_state_with_mock("processed");
+        let router = app(state.clone());
+
+        let response = router
+            .oneshot(
+                Request::post("/triggers/webhook/github")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&WebhookIngressRequest {
+                            session_id: "view-session".to_string(),
+                            payload: serde_json::json!({"action": "opened"}),
+                            attachments: Vec::new(),
+                            granted_scopes: BTreeSet::new(),
+                            idempotency_key: None,
+                            provider: None,
+                            policy_override: None,
+                        })
+                        .expect("request json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let view_response = app(state)
+            .oneshot(
+                Request::get("/sessions/view-session/view")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(view_response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(view_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let view: SessionView = serde_json::from_slice(&bytes).expect("session view");
+        assert_eq!(view.status, SessionStatus::Completed);
+        assert!(view.record_count >= 3);
+        assert!(
+            view.timeline
+                .iter()
+                .any(|item| matches!(item, TimelineItem::AssistantResponse { .. }))
+        );
+        assert!(!view.self_improvement.reflections.is_empty());
     }
 
     #[tokio::test]

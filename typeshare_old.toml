@@ -1,0 +1,8 @@
+[rust.type_mappings]
+"SystemTime" = "String"
+"usize" = "u32"
+"Value" = "any"
+"Duration" = "u32"
+"Instant" = "String"
+"u64" = "number"
+"i64" = "number"

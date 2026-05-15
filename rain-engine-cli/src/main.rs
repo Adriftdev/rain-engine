@@ -3,10 +3,7 @@
 
 use rain_engine_blob::BlobBackendConfig;
 use rain_engine_ingress::ValkeyStreamConfig;
-use rain_engine_runtime::{
-    ProviderBootstrapConfig, RuntimeBootstrapConfig, StoreBootstrapConfig, build_runtime_state,
-    serve,
-};
+use rain_engine_runtime::{ProviderBootstrapConfig, RuntimeBootstrapConfig, StoreBootstrapConfig};
 use rain_engine_store_valkey::ValkeyCoordinationStore;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -81,6 +78,7 @@ enum CliError {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
     let mut args = env::args().skip(1);
     let Some(command) = args.next() else {
         print_usage();
@@ -103,17 +101,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "run" => {
-            let path = required_path(args.next(), "run")?;
-            let config = read_agent_file(&path)?;
-            validate_agent_file(&config)?;
-            if let Some(coordination_url) = &config.coordination_url {
-                let _ = ValkeyCoordinationStore::connect(coordination_url)
-                    .map_err(|err| CliError::Message(err.message))?;
+            let mut is_daemon = false;
+            let mut path_arg = None;
+            for arg in args.by_ref() {
+                if arg == "--daemon" {
+                    is_daemon = true;
+                } else {
+                    path_arg = Some(arg);
+                }
             }
-            let state = build_runtime_state(config.runtime.clone())
-                .await
-                .map_err(|err| CliError::Message(err.to_string()))?;
-            serve(config.runtime.server.bind_address, state).await?;
+
+            if is_daemon {
+                println!("Starting daemon mode via rain-engine-gateway...");
+                let mut child = tokio::process::Command::new("cargo")
+                    .args(["run", "-p", "rain-engine-gateway"])
+                    .spawn()
+                    .map_err(|err| {
+                        CliError::Message(format!("Failed to start gateway daemon: {err}"))
+                    })?;
+
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("Received shutdown signal. Stopping daemon...");
+                        let _ = child.kill().await;
+                    }
+                    status = child.wait() => {
+                        println!("Daemon exited with status: {:?}", status);
+                    }
+                }
+            } else {
+                println!("Starting standalone mode...");
+                let path = required_path(path_arg, "run")?;
+                let config = read_agent_file(&path)?;
+                validate_agent_file(&config)?;
+                if let Some(coordination_url) = &config.coordination_url {
+                    let _ = ValkeyCoordinationStore::connect(coordination_url)
+                        .map_err(|err| CliError::Message(err.message))?;
+                }
+                let server = rain_engine::ServerBuilder::new().with_config(config.runtime.clone());
+                server
+                    .start()
+                    .await
+                    .map_err(|err| CliError::Message(err.to_string()))?;
+            }
+        }
+        "dev" => {
+            println!("Starting RainEngine Dev Environment...");
+
+            // Spawn the gateway daemon
+            let mut gateway_child = tokio::process::Command::new("cargo")
+                .args(["run", "-p", "rain-engine-gateway"])
+                .spawn()
+                .map_err(|err| {
+                    CliError::Message(format!("Failed to start gateway daemon: {err}"))
+                })?;
+
+            // Spawn the UI dev server
+            let ui_dir = env::current_dir()
+                .unwrap_or_default()
+                .join("rain-engine-ui");
+
+            let vite_bin = ui_dir.join("node_modules/.bin/vite");
+            let mut ui_child = tokio::process::Command::new(&vite_bin)
+                .current_dir(&ui_dir)
+                .spawn()
+                .map_err(|err| CliError::Message(format!("Failed to start UI server: {err}")))?;
+
+            println!("Both processes started. Press Ctrl+C to stop.");
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nReceived shutdown signal. Stopping processes...");
+                    let _ = gateway_child.kill().await;
+                    let _ = ui_child.kill().await;
+                }
+                status = gateway_child.wait() => {
+                    println!("Gateway daemon exited with status: {:?}", status);
+                    let _ = ui_child.kill().await;
+                }
+                status = ui_child.wait() => {
+                    println!("UI server exited with status: {:?}", status);
+                    let _ = gateway_child.kill().await;
+                }
+            }
+            println!("Dev environment shut down cleanly.");
         }
         "pull-pack" => {
             let pack_ref = args
@@ -131,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_usage() {
-    eprintln!("usage: rain-engine-cli <validate|print-config|run|pull-pack> ...");
+    eprintln!("usage: rain-engine-cli <validate|print-config|run [--daemon]|dev|pull-pack> ...");
 }
 
 fn required_path(value: Option<String>, command: &str) -> Result<PathBuf, CliError> {
@@ -161,12 +232,12 @@ fn validate_agent_file(agent: &AgentFile) -> Result<(), CliError> {
             "retrieval limits must be greater than zero".to_string(),
         ));
     }
-    if let StoreBootstrapConfig::Postgres { database_url } = &agent.runtime.store {
-        if database_url.trim().is_empty() {
-            return Err(CliError::Message(
-                "runtime.store.postgres.database_url must not be empty".to_string(),
-            ));
-        }
+    if let StoreBootstrapConfig::Postgres { database_url } = &agent.runtime.store
+        && database_url.trim().is_empty()
+    {
+        return Err(CliError::Message(
+            "runtime.store.postgres.database_url must not be empty".to_string(),
+        ));
     }
     match &agent.runtime.blob {
         BlobBackendConfig::LocalDirectory { path } if path.trim().is_empty() => {

@@ -1,19 +1,23 @@
 [workspace]
 members = [
     "rain-engine-blob",
+    "rain-engine-channels",
     "rain-engine-cli",
     "rain-engine-cognition",
     "rain-engine-core",
+    "rain-engine-gateway",
     "rain-engine-ingress",
     "rain-engine-macros",
     "rain-engine-memory",
     "rain-engine-provider-gemini",
     "rain-engine-openai",
+    "rain-engine-skills",
     "rain-engine-wasm",
     "rain-engine-runtime",
     "rain-engine-store-pg",
     "rain-engine-store-sqlite",
     "rain-engine-store-valkey",
+    "rain-engine-client",
 ]
 resolver = "2"
 
@@ -24,6 +28,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
+async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
@@ -37,9 +42,10 @@ serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres"] }
 syn = { version = "2", features = ["full"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "process", "io-util", "signal"] }
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 url = "2"
@@ -50,3 +56,40 @@ quote = "1"
 proc-macro2 = "1"
 redis = { version = "0.32.7", features = ["aio", "tokio-comp"] }
 serde_yaml = "0.9"
+typeshare = "1"
+
+[package]
+name = "rain-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "An event-sourced Rust kernel for building durable AI agent systems"
+repository = "https://github.com/peter-steinberger/rain-engine" # Example placeholder
+
+[features]
+default = ["server", "client", "sqlite", "gemini"]
+
+server = ["dep:rain-engine-runtime"]
+client = ["dep:rain-engine-client"]
+gemini = ["dep:rain-engine-provider-gemini"]
+openai = ["dep:rain-engine-openai"]
+sqlite = ["dep:rain-engine-store-sqlite"]
+postgres = ["dep:rain-engine-store-pg"]
+valkey = ["dep:rain-engine-store-valkey"]
+
+[dependencies]
+rain-engine-core = { path = "rain-engine-core" }
+rain-engine-blob = { path = "rain-engine-blob" }
+rain-engine-memory = { path = "rain-engine-memory" }
+rain-engine-client = { path = "rain-engine-client", optional = true }
+rain-engine-runtime = { path = "rain-engine-runtime", optional = true }
+rain-engine-store-sqlite = { path = "rain-engine-store-sqlite", optional = true }
+rain-engine-store-pg = { path = "rain-engine-store-pg", optional = true }
+rain-engine-store-valkey = { path = "rain-engine-store-valkey", optional = true }
+rain-engine-provider-gemini = { path = "rain-engine-provider-gemini", optional = true }
+rain-engine-openai = { path = "rain-engine-openai", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+rain-engine-runtime = { path = "rain-engine-runtime" }

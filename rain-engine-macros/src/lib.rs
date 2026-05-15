@@ -31,45 +31,45 @@ pub fn derive_skill_manifest(input: TokenStream) -> TokenStream {
         for meta in metas {
             match meta {
                 Meta::NameValue(value) if value.path.is_ident("name") => {
-                    if let syn::Expr::Lit(expr) = value.value {
-                        if let syn::Lit::Str(lit) = expr.lit {
-                            name = Some(lit);
-                        }
+                    if let syn::Expr::Lit(expr) = value.value
+                        && let syn::Lit::Str(lit) = expr.lit
+                    {
+                        name = Some(lit);
                     }
                 }
                 Meta::NameValue(value) if value.path.is_ident("description") => {
-                    if let syn::Expr::Lit(expr) = value.value {
-                        if let syn::Lit::Str(lit) = expr.lit {
-                            description = Some(lit);
-                        }
+                    if let syn::Expr::Lit(expr) = value.value
+                        && let syn::Lit::Str(lit) = expr.lit
+                    {
+                        description = Some(lit);
                     }
                 }
                 Meta::NameValue(value) if value.path.is_ident("timeout_ms") => {
-                    if let syn::Expr::Lit(expr) = value.value {
-                        if let syn::Lit::Int(lit) = expr.lit {
-                            timeout_ms = Some(lit);
-                        }
+                    if let syn::Expr::Lit(expr) = value.value
+                        && let syn::Lit::Int(lit) = expr.lit
+                    {
+                        timeout_ms = Some(lit);
                     }
                 }
                 Meta::NameValue(value) if value.path.is_ident("max_memory_bytes") => {
-                    if let syn::Expr::Lit(expr) = value.value {
-                        if let syn::Lit::Int(lit) = expr.lit {
-                            max_memory_bytes = Some(lit);
-                        }
+                    if let syn::Expr::Lit(expr) = value.value
+                        && let syn::Lit::Int(lit) = expr.lit
+                    {
+                        max_memory_bytes = Some(lit);
                     }
                 }
                 Meta::NameValue(value) if value.path.is_ident("max_fuel") => {
-                    if let syn::Expr::Lit(expr) = value.value {
-                        if let syn::Lit::Int(lit) = expr.lit {
-                            max_fuel = Some(lit);
-                        }
+                    if let syn::Expr::Lit(expr) = value.value
+                        && let syn::Lit::Int(lit) = expr.lit
+                    {
+                        max_fuel = Some(lit);
                     }
                 }
                 Meta::NameValue(value) if value.path.is_ident("approval_required") => {
-                    if let syn::Expr::Lit(expr) = value.value {
-                        if let syn::Lit::Bool(lit) = expr.lit {
-                            approval_required = lit.value;
-                        }
+                    if let syn::Expr::Lit(expr) = value.value
+                        && let syn::Lit::Bool(lit) = expr.lit
+                    {
+                        approval_required = lit.value;
                     }
                 }
                 Meta::List(list) if list.path.is_ident("scopes") => {

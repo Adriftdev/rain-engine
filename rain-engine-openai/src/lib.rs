@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use rain_engine_core::{
-    AgentAction, LlmProvider, PlannedSkillCall, ProviderContentPart, ProviderDecision,
-    ProviderError, ProviderErrorKind, ProviderRequest, ProviderRequestConfig,
+    AgentAction, LlmProvider, PlannedSkillCall, ProviderDecision, ProviderError, ProviderErrorKind,
+    ProviderRequest, ProviderRequestConfig,
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -88,10 +88,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 .config
                 .max_tokens
                 .or(self.config.default_request.max_tokens),
-            messages: vec![
-                ChatMessage::system(self.config.system_prompt.clone()),
-                ChatMessage::user(serialize_provider_request(&input)?),
-            ],
+            messages: map_to_chat_messages(&input, self.config.system_prompt.clone())?,
             tools: input
                 .available_skills
                 .iter()
@@ -127,9 +124,19 @@ impl LlmProvider for OpenAiCompatibleProvider {
             return Err(classify_status(status, body));
         }
 
-        let body: ChatCompletionResponse = response.json().await.map_err(|err| {
-            ProviderError::new(ProviderErrorKind::InvalidResponse, err.to_string(), false)
+        let raw_text = response.text().await.map_err(|err| {
+            ProviderError::new(ProviderErrorKind::Transport, err.to_string(), true)
         })?;
+
+        let body: ChatCompletionResponse = serde_json::from_str(&raw_text).map_err(|err| {
+            tracing::error!("OpenAI response deserialization failed: {err}\nRaw body: {raw_text}");
+            ProviderError::new(
+                ProviderErrorKind::InvalidResponse,
+                format!("error decoding response body: {err}"),
+                false,
+            )
+        })?;
+
         let choice = body.choices.into_iter().next().ok_or_else(|| {
             ProviderError::new(
                 ProviderErrorKind::InvalidResponse,
@@ -138,7 +145,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
             )
         })?;
 
-        if let Some(tool_calls) = choice.message.tool_calls {
+        if let Some(tool_calls) = choice.message.tool_calls
+            && !tool_calls.is_empty()
+        {
             let mut planned = Vec::with_capacity(tool_calls.len());
             for (index, tool_call) in tool_calls.into_iter().enumerate() {
                 let args = serde_json::from_str::<Value>(&tool_call.function.arguments).map_err(
@@ -193,47 +202,83 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
-fn serialize_provider_request(input: &ProviderRequest) -> Result<String, ProviderError> {
-    let contents = input
-        .contents
-        .iter()
-        .map(|message| {
-            let parts = message
-                .parts
-                .iter()
-                .map(|part| match part {
-                    ProviderContentPart::Text(text) => Value::String(text.clone()),
-                    ProviderContentPart::Json(value) => value.clone(),
-                    ProviderContentPart::InlineData(payload) => json!({
-                        "mime_type": payload.mime_type,
-                        "file_name": payload.file_name,
-                        "size_bytes": payload.data.len(),
-                    }),
-                    ProviderContentPart::Attachment(attachment) => json!({
-                        "attachment_id": attachment.attachment_id,
-                        "mime_type": attachment.mime_type,
-                        "size_bytes": attachment.size_bytes,
-                    }),
-                    ProviderContentPart::ToolResult(result) => json!({
-                        "call_id": result.call_id,
-                        "skill_name": result.skill_name,
-                        "output": result.output,
-                    }),
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "role": format!("{:?}", message.role),
-                "parts": parts,
-            })
-        })
-        .collect::<Vec<_>>();
+fn map_to_chat_messages(
+    input: &ProviderRequest,
+    system_prompt: String,
+) -> Result<Vec<ChatMessage>, ProviderError> {
+    let mut messages = vec![ChatMessage::system(system_prompt)];
+    for msg in &input.contents {
+        let role = match msg.role {
+            rain_engine_core::ProviderRole::System => "system",
+            rain_engine_core::ProviderRole::User => "user",
+            rain_engine_core::ProviderRole::Assistant => "assistant",
+            rain_engine_core::ProviderRole::Tool => "tool",
+        };
 
-    serde_json::to_string(&json!({
-        "trigger": input.trigger,
-        "context": input.context,
-        "contents": contents,
-    }))
-    .map_err(|err| ProviderError::new(ProviderErrorKind::Internal, err.to_string(), false))
+        let mut content = String::new();
+        let mut tool_calls = None;
+        let mut tool_call_id = None;
+
+        for part in &msg.parts {
+            match part {
+                rain_engine_core::ProviderContentPart::Text(t) => {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(t);
+                }
+                rain_engine_core::ProviderContentPart::Json(j) => {
+                    // Try to parse as tool calls if it's an assistant message
+                    if msg.role == rain_engine_core::ProviderRole::Assistant {
+                        if let Ok(calls) =
+                            serde_json::from_value::<Vec<PlannedSkillCall>>(j.clone())
+                        {
+                            tool_calls = Some(
+                                calls
+                                    .into_iter()
+                                    .map(|c| ToolCallRequest {
+                                        id: c.call_id,
+                                        kind: "function".to_string(),
+                                        function: ToolFunctionCall {
+                                            name: c.name,
+                                            arguments: c.args.to_string(),
+                                        },
+                                    })
+                                    .collect(),
+                            );
+                        } else {
+                            if !content.is_empty() {
+                                content.push('\n');
+                            }
+                            content.push_str(&j.to_string());
+                        }
+                    } else {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&j.to_string());
+                    }
+                }
+                rain_engine_core::ProviderContentPart::ToolResult(r) => {
+                    content.push_str(&serde_json::to_string(&r.output).unwrap_or_default());
+                    tool_call_id = Some(r.call_id.clone());
+                }
+                _ => {}
+            }
+        }
+
+        messages.push(ChatMessage {
+            role: role.to_string(),
+            content: if content.is_empty() && tool_calls.is_some() {
+                None
+            } else {
+                Some(content)
+            },
+            tool_calls,
+            tool_call_id,
+        });
+    }
+    Ok(messages)
 }
 
 fn classify_status(status: StatusCode, body: String) -> ProviderError {
@@ -270,21 +315,35 @@ struct ChatCompletionRequest {
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallRequest>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCallRequest {
+    #[serde(rename = "type")]
+    kind: String,
+    id: String,
+    function: ToolFunctionCall,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 impl ChatMessage {
     fn system(content: String) -> Self {
         Self {
             role: "system".to_string(),
-            content,
-        }
-    }
-
-    fn user(content: String) -> Self {
-        Self {
-            role: "user".to_string(),
-            content,
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 }
@@ -344,7 +403,7 @@ mod tests {
     use axum::{Json, Router, routing::post};
     use rain_engine_core::{
         AgentContextSnapshot, AgentId, AgentStateSnapshot, AgentTrigger, EnginePolicy,
-        SkillDefinition, SkillManifest,
+        ProviderContentPart, SkillDefinition, SkillManifest,
     };
     use serde_json::json;
 

@@ -44,7 +44,7 @@ pub enum IngressError {
 
 #[derive(Clone)]
 pub struct ValkeyStreamIngress {
-    store: ValkeyCoordinationStore,
+    _store: ValkeyCoordinationStore,
     config: ValkeyStreamConfig,
 }
 
@@ -52,13 +52,13 @@ impl ValkeyStreamIngress {
     pub fn new(config: ValkeyStreamConfig) -> Result<Self, IngressError> {
         let store = ValkeyCoordinationStore::connect(&config.url)
             .map_err(|err| IngressError::Message(err.message))?;
-        Ok(Self { store, config })
+        Ok(Self {
+            _store: store,
+            config,
+        })
     }
 
     pub async fn publish(&self, event: &IngressEventEnvelope) -> Result<String, IngressError> {
-        match &self.store {
-            ValkeyCoordinationStore { .. } => {}
-        }
         let client = redis::Client::open(self.config.url.clone())
             .map_err(|err| IngressError::Message(err.to_string()))?;
         let stream = self.config.stream.clone();
