@@ -1,20 +1,22 @@
 use crate::{
     AdvanceRequest, AdvanceResult, AgentAction, AgentContext, AgentStateDelta, AgentTrigger,
-    ApprovalDecision, ApprovalResolutionRecord, ContinueRequest, DelegationRecord, EngineOutcome,
-    ExecutionMetadata, KernelEvent, KernelEventRecord, LlmProvider, MemoryError, MemoryStore,
-    MemoryStoreExt, ModelDecisionRecord, OutcomeRecord, PendingApprovalRecord, PlannedSkillCall,
-    PolicyOverlay, PolicyOverlayPatch, PolicyOverlayStatus, PolicyTuningAction, PolicyTuningRecord,
-    ProcessRequest, ProfilePatchRecord, ProviderContentPart, ProviderDecision, ProviderMessage,
-    ProviderRequest, ProviderRole, ReflectionRecord, ResumeToken, SelfImprovementMode,
-    SessionRecord, SessionSnapshot, SkillBackendKind, SkillDefinition, SkillFailure,
-    SkillFailureKind, SkillInvocation, SkillManifest, StopReason, StrategyPreferenceRecord,
-    SuspendReason, ToolCallRecord, ToolPerformanceRecord, ToolResultRecord, TriggerRecord,
-    WakeRequestRecord,
+    ApprovalDecision, ApprovalResolutionRecord, ContinueRequest, DelegationRecord,
+    DeliberationOutcome, DeliberationRecord, EngineOutcome, ExecutionMetadata, KernelEvent,
+    KernelEventRecord, LlmProvider, MemoryError, MemoryStore, MemoryStoreExt, ModelDecisionRecord,
+    OutcomeRecord, PendingApprovalRecord, PlannedSkillCall, PolicyOverlay, PolicyOverlayPatch,
+    PolicyOverlayStatus, PolicyTuningAction, PolicyTuningRecord, ProcessRequest,
+    ProfilePatchRecord, ProviderContentPart, ProviderDecision, ProviderMessage, ProviderRequest,
+    ProviderRole, ReflectionRecord, ResumeToken, SelfImprovementMode, SessionRecord,
+    SessionSnapshot, SkillBackendKind, SkillDefinition, SkillFailure, SkillFailureKind,
+    SkillInputValidationRecord, SkillInvocation, SkillManifest, StopReason,
+    StrategyPreferenceRecord, SuspendReason, ToolCallRecord, ToolDependency, ToolExecutionGraph,
+    ToolNode, ToolNodeCheckpointRecord, ToolNodeStatus, ToolPerformanceRecord, ToolResultRecord,
+    TriggerRecord, WakeRequestRecord,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
 use metrics::{counter, gauge, histogram};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use thiserror::Error;
@@ -446,7 +448,7 @@ impl AgentEngine {
             .clone()
             .with_overlay(snapshot.active_policy_overlay());
         let deadline = Instant::now() + effective_policy.max_execution_time();
-        let context = AgentContext {
+        let mut context = AgentContext {
             session_id: request.session_id.clone(),
             records: snapshot.records.clone(),
             prior_tool_results: snapshot.tool_results(),
@@ -461,6 +463,59 @@ impl AgentEngine {
                 cancellation: request.cancellation.clone(),
             },
         };
+
+        if let Some(graph) = snapshot.active_tool_execution_graph() {
+            let calls = graph
+                .nodes
+                .iter()
+                .map(|node| PlannedSkillCall {
+                    call_id: node.call_id.clone(),
+                    name: node.skill_name.clone(),
+                    args: node.args.clone(),
+                    priority: node.priority,
+                    depends_on: node
+                        .dependencies
+                        .iter()
+                        .map(|dependency| dependency.call_id.clone())
+                        .collect(),
+                    retry_policy: node.retry_policy.clone(),
+                    dry_run: node.dry_run,
+                })
+                .collect::<Vec<_>>();
+            match self
+                .execute_planned_calls(&context, graph.step, calls, true)
+                .await?
+            {
+                BatchExecution::Executed(batch) => {
+                    for result in batch.results {
+                        self.memory
+                            .append_tool_result(&context.session_id, result.clone())
+                            .await?;
+                        context.prior_tool_results.push(result.clone());
+                        context.records.push(SessionRecord::ToolResult(result));
+                    }
+                    return Ok(AdvanceResult {
+                        outcome: None,
+                        emitted_events: Vec::new(),
+                        state_delta: AgentStateDelta::default(),
+                        wake_request: None,
+                    });
+                }
+                BatchExecution::Suspended { .. } => {
+                    let outcome = self
+                        .finish(
+                            &mut context,
+                            StopReason::PolicyAborted,
+                            None,
+                            Some("checkpointed graph unexpectedly suspended".to_string()),
+                            graph.step,
+                            None,
+                        )
+                        .await?;
+                    return Ok(build_advance_result(outcome, Vec::new()));
+                }
+            }
+        }
 
         self.perform_single_step(
             context,
@@ -587,6 +642,36 @@ impl AgentEngine {
             .push(SessionRecord::ModelDecision(decision_record));
 
         match decision.action {
+            AgentAction::Plan {
+                summary,
+                candidate_actions,
+                confidence,
+            } => {
+                let record = DeliberationRecord {
+                    deliberation_id: Uuid::new_v4().to_string(),
+                    trigger_id: context.metadata.trigger_id.clone(),
+                    step: steps_executed,
+                    created_at: SystemTime::now(),
+                    summary,
+                    candidate_actions,
+                    confidence,
+                    outcome: if confidence >= 0.7 {
+                        DeliberationOutcome::ReadyToAct
+                    } else {
+                        DeliberationOutcome::NeedsRefinement
+                    },
+                };
+                self.memory
+                    .append_deliberation(&context.session_id, record.clone())
+                    .await?;
+                context.records.push(SessionRecord::Deliberation(record));
+                Ok(AdvanceResult {
+                    outcome: None,
+                    emitted_events: emitted_events.clone(),
+                    state_delta: derive_state_delta(&emitted_events),
+                    wake_request: emitted_events.iter().find_map(extract_wake_request),
+                })
+            }
             AgentAction::Respond { content } => {
                 let outcome = self
                     .finish(
@@ -940,124 +1025,405 @@ impl AgentEngine {
             }
         }
 
-        let mut immediate_results = Vec::<ToolResultRecord>::new();
-        let mut executable = VecDeque::<PreparedCall>::new();
-
-        for call in calls.iter() {
-            let Some(skill) = self
-                .skills
-                .get(&call.name)
-                .map(|entry| entry.value().clone())
-            else {
-                immediate_results.push(error_result(
-                    call.call_id.clone(),
-                    call.name.clone(),
-                    SkillFailureKind::Internal,
-                    format!("skill `{}` is not registered", call.name),
-                ));
-                continue;
-            };
-
-            if !skill
-                .manifest
-                .required_scopes
-                .iter()
-                .all(|scope| context.granted_scopes.contains(scope))
-            {
-                counter!("rain_engine.permission_denials_total").increment(1);
-                immediate_results.push(error_result(
-                    call.call_id.clone(),
-                    call.name.clone(),
-                    SkillFailureKind::PermissionDenied,
-                    format!("missing required scopes for skill `{}`", call.name),
-                ));
-                continue;
-            }
-
-            if matches!(skill.backend, RegisteredSkillBackend::Native(_))
-                && !context.metadata.policy.allow_native_skills
-            {
-                immediate_results.push(error_result(
-                    call.call_id.clone(),
-                    call.name.clone(),
-                    SkillFailureKind::PermissionDenied,
-                    "native skills are disabled by policy".to_string(),
-                ));
-                continue;
-            }
-
-            let call_record = ToolCallRecord {
-                call_id: call.call_id.clone(),
-                step,
-                called_at: SystemTime::now(),
-                skill_name: skill.manifest.name.clone(),
-                args: call.args.clone(),
-                backend_kind: skill.backend.kind(),
-            };
-            self.memory
-                .append_tool_call(&context.session_id, call_record.clone())
-                .await?;
-            counter!(
-                "rain_engine.tool_calls_total",
-                "skill" => skill.manifest.name.clone(),
-                "backend" => format!("{:?}", skill.backend.kind())
+        let graph = existing_or_new_graph(context, step, &calls);
+        if !context.records.iter().any(|record| {
+            matches!(
+                record,
+                SessionRecord::ToolExecutionGraph(existing) if existing.graph_id == graph.graph_id
             )
-            .increment(1);
-
-            let mut manifest = skill.manifest.clone();
-            manifest.resource_policy = manifest.effective_resource_policy(&context.metadata.policy);
-            executable.push_back(PreparedCall {
-                call_id: call.call_id.clone(),
-                name: call.name.clone(),
-                args: call.args.clone(),
-                manifest,
-                backend: skill.backend.clone(),
-                context_snapshot: context.to_snapshot(step),
-            });
+        }) {
+            self.memory
+                .append_tool_execution_graph(&context.session_id, graph.clone())
+                .await?;
+            for node in &graph.nodes {
+                self.append_tool_checkpoint(context, &graph, node, ToolNodeStatus::Queued, 0, None)
+                    .await?;
+            }
         }
 
-        let max_parallel = context.metadata.policy.max_parallel_skill_calls.max(1);
+        let mut status_by_call = latest_tool_statuses(context, &graph.graph_id);
+        let mut attempts_by_call = started_attempt_counts(context, &graph.graph_id);
+        let mut results_by_call = context
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::ToolResult(result) => Some((result.call_id.clone(), result.clone())),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let mut new_results = Vec::<ToolResultRecord>::new();
+        let max_parallel = context
+            .metadata
+            .policy
+            .max_parallel_skill_calls
+            .max(1)
+            .min(context.metadata.policy.max_ready_tool_nodes.max(1));
         gauge!("rain_engine.registered_skills").set(self.skills.len() as f64);
-        let mut join_set = JoinSet::new();
-        let mut pending = executable;
-        let mut results_by_id = HashMap::<String, ToolResultRecord>::new();
 
-        while !pending.is_empty() || !join_set.is_empty() {
-            while join_set.len() < max_parallel && !pending.is_empty() {
-                let prepared = pending.pop_front().expect("pending call exists");
-                join_set.spawn(run_prepared_call(prepared));
+        loop {
+            let skipped = self
+                .skip_blocked_nodes(
+                    context,
+                    &graph,
+                    &mut status_by_call,
+                    &mut results_by_call,
+                    &mut new_results,
+                    step,
+                )
+                .await?;
+            let ready = ready_nodes(&graph, &status_by_call)
+                .into_iter()
+                .take(context.metadata.policy.max_ready_tool_nodes.max(1))
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                if !skipped {
+                    break;
+                }
+                continue;
             }
 
-            if let Some(joined) = join_set.join_next().await {
+            let mut join_set = JoinSet::new();
+            for node in ready.into_iter().take(max_parallel) {
+                let prepared = self
+                    .prepare_node(context, &graph, &node, step, &mut attempts_by_call)
+                    .await?;
+                match prepared {
+                    PreparedNode::Executable(prepared) => {
+                        join_set.spawn(run_prepared_call(*prepared));
+                    }
+                    PreparedNode::Immediate(result) => {
+                        let status = final_status_for_result(&result);
+                        status_by_call.insert(node.call_id.clone(), status);
+                        results_by_call.insert(result.call_id.clone(), result.clone());
+                        new_results.push(result);
+                    }
+                }
+            }
+
+            while let Some(joined) = join_set.join_next().await {
                 let result = joined.map_err(|err| EngineError::Blob(err.to_string()))??;
-                results_by_id.insert(result.call_id.clone(), result);
+                let Some(node) = graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.call_id == result.call_id)
+                else {
+                    continue;
+                };
+                let status = final_status_for_result(&result);
+                self.append_tool_checkpoint(
+                    context,
+                    &graph,
+                    node,
+                    status.clone(),
+                    *attempts_by_call.get(&node.call_id).unwrap_or(&1),
+                    result_detail(&result),
+                )
+                .await?;
+                status_by_call.insert(node.call_id.clone(), status);
+                results_by_call.insert(result.call_id.clone(), result.clone());
+                new_results.push(result);
             }
         }
 
-        let mut ordered = Vec::with_capacity(calls.len());
-        let mut any_success = false;
-        for call in calls {
-            if let Some(result) = results_by_id.remove(&call.call_id) {
-                if result.output.is_ok() {
-                    any_success = true;
-                }
-                ordered.push(result);
-            } else if let Some(index) = immediate_results
-                .iter()
-                .position(|result| result.call_id == call.call_id)
-            {
-                let result = immediate_results.remove(index);
-                if result.output.is_ok() {
-                    any_success = true;
-                }
-                ordered.push(result);
-            }
-        }
-
+        let ordered = graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                new_results
+                    .iter()
+                    .find(|result| result.call_id == node.call_id)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let any_success = ordered.iter().any(|result| result.output.is_ok());
         Ok(BatchExecution::Executed(ExecutedBatch {
             results: ordered,
             all_failed: !any_success,
         }))
+    }
+
+    async fn append_tool_checkpoint(
+        &self,
+        context: &AgentContext,
+        graph: &ToolExecutionGraph,
+        node: &ToolNode,
+        status: ToolNodeStatus,
+        attempt: usize,
+        detail: Option<String>,
+    ) -> Result<(), EngineError> {
+        let record = ToolNodeCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            graph_id: graph.graph_id.clone(),
+            call_id: node.call_id.clone(),
+            skill_name: node.skill_name.clone(),
+            step: graph.step,
+            status,
+            attempt,
+            occurred_at: SystemTime::now(),
+            detail,
+        };
+        self.memory
+            .append_tool_node_checkpoint(&context.session_id, record)
+            .await?;
+        Ok(())
+    }
+
+    async fn skip_blocked_nodes(
+        &self,
+        context: &AgentContext,
+        graph: &ToolExecutionGraph,
+        status_by_call: &mut HashMap<String, ToolNodeStatus>,
+        results_by_call: &mut HashMap<String, ToolResultRecord>,
+        new_results: &mut Vec<ToolResultRecord>,
+        step: usize,
+    ) -> Result<bool, EngineError> {
+        let mut changed = false;
+        for node in &graph.nodes {
+            if is_terminal_status(status_by_call.get(&node.call_id)) {
+                continue;
+            }
+            let blocked_by = node.dependencies.iter().find(|dependency| {
+                matches!(
+                    status_by_call.get(&dependency.call_id),
+                    Some(ToolNodeStatus::Failed)
+                        | Some(ToolNodeStatus::Skipped)
+                        | Some(ToolNodeStatus::TimedOut)
+                )
+            });
+            if let Some(blocked_by) = blocked_by {
+                let message = format!("dependency `{}` did not succeed", blocked_by.call_id);
+                let result = error_result(
+                    node.call_id.clone(),
+                    node.skill_name.clone(),
+                    SkillFailureKind::Internal,
+                    message.clone(),
+                );
+                self.append_tool_checkpoint(
+                    context,
+                    graph,
+                    node,
+                    ToolNodeStatus::Skipped,
+                    0,
+                    Some(message),
+                )
+                .await?;
+                status_by_call.insert(node.call_id.clone(), ToolNodeStatus::Skipped);
+                results_by_call.insert(node.call_id.clone(), result.clone());
+                new_results.push(result);
+                let _ = step;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn prepare_node(
+        &self,
+        context: &AgentContext,
+        graph: &ToolExecutionGraph,
+        node: &ToolNode,
+        step: usize,
+        attempts_by_call: &mut HashMap<String, usize>,
+    ) -> Result<PreparedNode, EngineError> {
+        let Some(skill) = self
+            .skills
+            .get(&node.skill_name)
+            .map(|entry| entry.value().clone())
+        else {
+            self.append_validation(
+                context,
+                graph,
+                node,
+                false,
+                vec![format!("skill `{}` is not registered", node.skill_name)],
+            )
+            .await?;
+            self.append_tool_checkpoint(
+                context,
+                graph,
+                node,
+                ToolNodeStatus::Failed,
+                0,
+                Some(format!("skill `{}` is not registered", node.skill_name)),
+            )
+            .await?;
+            return Ok(PreparedNode::Immediate(error_result(
+                node.call_id.clone(),
+                node.skill_name.clone(),
+                SkillFailureKind::Internal,
+                format!("skill `{}` is not registered", node.skill_name),
+            )));
+        };
+
+        if context.metadata.policy.validate_tool_args {
+            let errors = validate_against_schema(&node.args, &skill.manifest.input_schema);
+            self.append_validation(context, graph, node, errors.is_empty(), errors.clone())
+                .await?;
+            if !errors.is_empty() {
+                let message = errors.join("; ");
+                self.append_tool_checkpoint(
+                    context,
+                    graph,
+                    node,
+                    ToolNodeStatus::Failed,
+                    0,
+                    Some(message.clone()),
+                )
+                .await?;
+                return Ok(PreparedNode::Immediate(error_result(
+                    node.call_id.clone(),
+                    node.skill_name.clone(),
+                    SkillFailureKind::InvalidArguments,
+                    message,
+                )));
+            }
+        }
+        self.append_tool_checkpoint(context, graph, node, ToolNodeStatus::Validated, 0, None)
+            .await?;
+
+        if !skill
+            .manifest
+            .required_scopes
+            .iter()
+            .all(|scope| context.granted_scopes.contains(scope))
+        {
+            counter!("rain_engine.permission_denials_total").increment(1);
+            self.append_tool_checkpoint(
+                context,
+                graph,
+                node,
+                ToolNodeStatus::Failed,
+                0,
+                Some(format!(
+                    "missing required scopes for skill `{}`",
+                    node.skill_name
+                )),
+            )
+            .await?;
+            return Ok(PreparedNode::Immediate(error_result(
+                node.call_id.clone(),
+                node.skill_name.clone(),
+                SkillFailureKind::PermissionDenied,
+                format!("missing required scopes for skill `{}`", node.skill_name),
+            )));
+        }
+
+        if matches!(skill.backend, RegisteredSkillBackend::Native(_))
+            && !context.metadata.policy.allow_native_skills
+        {
+            self.append_tool_checkpoint(
+                context,
+                graph,
+                node,
+                ToolNodeStatus::Failed,
+                0,
+                Some("native skills are disabled by policy".to_string()),
+            )
+            .await?;
+            return Ok(PreparedNode::Immediate(error_result(
+                node.call_id.clone(),
+                node.skill_name.clone(),
+                SkillFailureKind::PermissionDenied,
+                "native skills are disabled by policy".to_string(),
+            )));
+        }
+
+        let mut manifest = skill.manifest.clone();
+        manifest.resource_policy = manifest.effective_resource_policy(&context.metadata.policy);
+        if node.dry_run
+            && (!context.metadata.policy.enable_tool_dry_run
+                || !manifest.resource_policy.dry_run_supported)
+        {
+            self.append_tool_checkpoint(
+                context,
+                graph,
+                node,
+                ToolNodeStatus::Failed,
+                0,
+                Some("dry-run execution is not enabled for this skill".to_string()),
+            )
+            .await?;
+            return Ok(PreparedNode::Immediate(error_result(
+                node.call_id.clone(),
+                node.skill_name.clone(),
+                SkillFailureKind::CapabilityDenied,
+                "dry-run execution is not enabled for this skill".to_string(),
+            )));
+        }
+
+        let attempt = attempts_by_call.entry(node.call_id.clone()).or_insert(0);
+        *attempt += 1;
+        self.append_tool_checkpoint(
+            context,
+            graph,
+            node,
+            ToolNodeStatus::Started,
+            *attempt,
+            None,
+        )
+        .await?;
+
+        let call_record = ToolCallRecord {
+            call_id: node.call_id.clone(),
+            step,
+            called_at: SystemTime::now(),
+            skill_name: skill.manifest.name.clone(),
+            args: node.args.clone(),
+            backend_kind: skill.backend.kind(),
+        };
+        self.memory
+            .append_tool_call(&context.session_id, call_record)
+            .await?;
+        counter!(
+            "rain_engine.tool_calls_total",
+            "skill" => skill.manifest.name.clone(),
+            "backend" => format!("{:?}", skill.backend.kind())
+        )
+        .increment(1);
+
+        let call_retry_limit = node
+            .retry_policy
+            .max_retries
+            .min(manifest.resource_policy.max_retries)
+            .min(context.metadata.policy.max_tool_retries_per_step);
+        Ok(PreparedNode::Executable(Box::new(PreparedCall {
+            call_id: node.call_id.clone(),
+            name: node.skill_name.clone(),
+            args: node.args.clone(),
+            manifest,
+            backend: skill.backend.clone(),
+            context_snapshot: context.to_snapshot(step),
+            dry_run: node.dry_run,
+            max_retries: call_retry_limit,
+            retry_backoff_ms: node
+                .retry_policy
+                .retry_backoff_ms
+                .max(1)
+                .min(skill.manifest.resource_policy.retry_backoff_ms.max(1)),
+        })))
+    }
+
+    async fn append_validation(
+        &self,
+        context: &AgentContext,
+        graph: &ToolExecutionGraph,
+        node: &ToolNode,
+        valid: bool,
+        errors: Vec<String>,
+    ) -> Result<(), EngineError> {
+        let record = SkillInputValidationRecord {
+            validation_id: Uuid::new_v4().to_string(),
+            graph_id: graph.graph_id.clone(),
+            call_id: node.call_id.clone(),
+            skill_name: node.skill_name.clone(),
+            validated_at: SystemTime::now(),
+            valid,
+            errors,
+        };
+        self.memory
+            .append_skill_input_validation(&context.session_id, record)
+            .await?;
+        Ok(())
     }
 
     async fn finish(
@@ -1230,6 +1596,7 @@ impl AgentEngine {
 
 fn action_metric_label(action: &AgentAction) -> &'static str {
     match action {
+        AgentAction::Plan { .. } => "plan",
         AgentAction::Respond { .. } => "respond",
         AgentAction::CallSkills(_) => "call_skills",
         AgentAction::Continue { .. } => "continue",
@@ -1485,6 +1852,201 @@ fn increase_usize_by_percent(value: usize, percent: f64) -> usize {
     ((value.max(1) as f64) * (1.0 + percent / 100.0)).ceil() as usize
 }
 
+fn existing_or_new_graph(
+    context: &AgentContext,
+    step: usize,
+    calls: &[PlannedSkillCall],
+) -> ToolExecutionGraph {
+    let call_ids = calls
+        .iter()
+        .map(|call| call.call_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some(graph) = context
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            SessionRecord::ToolExecutionGraph(graph)
+                if graph.step == step
+                    && graph
+                        .nodes
+                        .iter()
+                        .map(|node| node.call_id.as_str())
+                        .collect::<BTreeSet<_>>()
+                        == call_ids =>
+            {
+                Some(graph.clone())
+            }
+            _ => None,
+        })
+    {
+        return graph;
+    }
+
+    ToolExecutionGraph {
+        graph_id: format!("{}:{step}", context.metadata.trigger_id),
+        trigger_id: context.metadata.trigger_id.clone(),
+        step,
+        created_at: SystemTime::now(),
+        nodes: calls
+            .iter()
+            .enumerate()
+            .map(|(provider_order, call)| ToolNode {
+                call_id: call.call_id.clone(),
+                skill_name: call.name.clone(),
+                args: call.args.clone(),
+                priority: call.priority,
+                dependencies: call
+                    .depends_on
+                    .iter()
+                    .map(|call_id| ToolDependency {
+                        call_id: call_id.clone(),
+                    })
+                    .collect(),
+                retry_policy: call.retry_policy.clone(),
+                dry_run: call.dry_run,
+                provider_order,
+            })
+            .collect(),
+    }
+}
+
+fn latest_tool_statuses(context: &AgentContext, graph_id: &str) -> HashMap<String, ToolNodeStatus> {
+    let mut statuses = HashMap::new();
+    for record in &context.records {
+        if let SessionRecord::ToolNodeCheckpoint(checkpoint) = record
+            && checkpoint.graph_id == graph_id
+        {
+            statuses.insert(checkpoint.call_id.clone(), checkpoint.status.clone());
+        }
+    }
+    statuses
+}
+
+fn started_attempt_counts(context: &AgentContext, graph_id: &str) -> HashMap<String, usize> {
+    let mut attempts = HashMap::<String, usize>::new();
+    for record in &context.records {
+        if let SessionRecord::ToolNodeCheckpoint(checkpoint) = record
+            && checkpoint.graph_id == graph_id
+            && checkpoint.status == ToolNodeStatus::Started
+        {
+            let current = attempts.entry(checkpoint.call_id.clone()).or_default();
+            *current = (*current).max(checkpoint.attempt);
+        }
+    }
+    attempts
+}
+
+fn ready_nodes(
+    graph: &ToolExecutionGraph,
+    status_by_call: &HashMap<String, ToolNodeStatus>,
+) -> Vec<ToolNode> {
+    let mut nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| !is_terminal_status(status_by_call.get(&node.call_id)))
+        .filter(|node| {
+            node.dependencies.iter().all(|dependency| {
+                matches!(
+                    status_by_call.get(&dependency.call_id),
+                    Some(ToolNodeStatus::Succeeded)
+                )
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then(left.provider_order.cmp(&right.provider_order))
+            .then(left.call_id.cmp(&right.call_id))
+    });
+    nodes
+}
+
+fn is_terminal_status(status: Option<&ToolNodeStatus>) -> bool {
+    matches!(
+        status,
+        Some(
+            ToolNodeStatus::Succeeded
+                | ToolNodeStatus::Failed
+                | ToolNodeStatus::Skipped
+                | ToolNodeStatus::TimedOut
+        )
+    )
+}
+
+fn final_status_for_result(result: &ToolResultRecord) -> ToolNodeStatus {
+    match &result.output {
+        Ok(_) => ToolNodeStatus::Succeeded,
+        Err(error) if error.kind == SkillFailureKind::Timeout => ToolNodeStatus::TimedOut,
+        Err(_) => ToolNodeStatus::Failed,
+    }
+}
+
+fn result_detail(result: &ToolResultRecord) -> Option<String> {
+    match &result.output {
+        Ok(_) => None,
+        Err(error) => Some(error.message.clone()),
+    }
+}
+
+fn validate_against_schema(value: &serde_json::Value, schema: &serde_json::Value) -> Vec<String> {
+    let schema_type = schema.get("type").and_then(serde_json::Value::as_str);
+    let mut errors = Vec::new();
+    if let Some(schema_type) = schema_type
+        && !json_type_matches(value, schema_type)
+    {
+        errors.push(format!("expected root type `{schema_type}`"));
+        return errors;
+    }
+
+    if schema_type == Some("object") {
+        let Some(object) = value.as_object() else {
+            return vec!["expected root object".to_string()];
+        };
+        if let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) {
+            for required_key in required.iter().filter_map(serde_json::Value::as_str) {
+                if !object.contains_key(required_key) {
+                    errors.push(format!("missing required property `{required_key}`"));
+                }
+            }
+        }
+        if let Some(properties) = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (key, property_schema) in properties {
+                let Some(property_value) = object.get(key) else {
+                    continue;
+                };
+                if let Some(property_type) = property_schema
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    && !json_type_matches(property_value, property_type)
+                {
+                    errors.push(format!("property `{key}` expected type `{property_type}`"));
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn json_type_matches(value: &serde_json::Value, expected: &str) -> bool {
+    match expected {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
 struct PreparedCall {
     call_id: String,
     name: String,
@@ -1492,6 +2054,14 @@ struct PreparedCall {
     manifest: SkillManifest,
     backend: RegisteredSkillBackend,
     context_snapshot: crate::AgentContextSnapshot,
+    dry_run: bool,
+    max_retries: usize,
+    retry_backoff_ms: u64,
+}
+
+enum PreparedNode {
+    Executable(Box<PreparedCall>),
+    Immediate(ToolResultRecord),
 }
 
 #[derive(Debug)]
@@ -1511,18 +2081,29 @@ enum BatchExecution {
 }
 
 async fn run_prepared_call(prepared: PreparedCall) -> Result<ToolResultRecord, EngineError> {
-    let invocation = SkillInvocation {
-        call_id: prepared.call_id.clone(),
-        manifest: prepared.manifest.clone(),
-        args: prepared.args,
-        context: prepared.context_snapshot,
-    };
-
     let started = Instant::now();
-    let output = match &prepared.backend {
-        RegisteredSkillBackend::Wasm(executor) => executor.execute(invocation).await,
-        RegisteredSkillBackend::Native(executor) => executor.execute(invocation).await,
-    };
+    let mut output = Err(SkillExecutionError::new(
+        SkillFailureKind::Internal,
+        "tool was not attempted",
+    ));
+    let attempts = prepared.max_retries + 1;
+    for attempt in 0..attempts {
+        let invocation = SkillInvocation {
+            call_id: prepared.call_id.clone(),
+            manifest: prepared.manifest.clone(),
+            args: prepared.args.clone(),
+            context: prepared.context_snapshot.clone(),
+            dry_run: prepared.dry_run,
+        };
+        output = match &prepared.backend {
+            RegisteredSkillBackend::Wasm(executor) => executor.execute(invocation).await,
+            RegisteredSkillBackend::Native(executor) => executor.execute(invocation).await,
+        };
+        if output.is_ok() || !is_retryable_skill_error(&output) || attempt + 1 >= attempts {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(prepared.retry_backoff_ms)).await;
+    }
     histogram!("rain_engine.tool_latency_seconds").record(started.elapsed().as_secs_f64());
 
     let output = match output {
@@ -1538,7 +2119,9 @@ async fn run_prepared_call(prepared: PreparedCall) -> Result<ToolResultRecord, E
                 SkillFailureKind::Timeout => {
                     counter!("rain_engine.tool_timeouts_total").increment(1);
                 }
-                SkillFailureKind::InvalidResponse | SkillFailureKind::Internal => {}
+                SkillFailureKind::InvalidArguments
+                | SkillFailureKind::InvalidResponse
+                | SkillFailureKind::Internal => {}
             }
             Err(SkillFailure {
                 kind: err.kind,
@@ -1553,6 +2136,16 @@ async fn run_prepared_call(prepared: PreparedCall) -> Result<ToolResultRecord, E
         skill_name: prepared.name,
         output,
     })
+}
+
+fn is_retryable_skill_error(output: &Result<serde_json::Value, SkillExecutionError>) -> bool {
+    matches!(
+        output,
+        Err(SkillExecutionError {
+            kind: SkillFailureKind::Timeout | SkillFailureKind::Internal | SkillFailureKind::Trap,
+            ..
+        })
+    )
 }
 
 fn error_result(
@@ -2053,6 +2646,18 @@ mod tests {
         }
     }
 
+    fn planned(call_id: &str, name: &str, args: serde_json::Value) -> PlannedSkillCall {
+        PlannedSkillCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            args,
+            priority: 0,
+            depends_on: Vec::new(),
+            retry_policy: Default::default(),
+            dry_run: false,
+        }
+    }
+
     fn message_trigger(content: &str) -> AgentTrigger {
         AgentTrigger::Message {
             user_id: "u1".to_string(),
@@ -2131,6 +2736,10 @@ mod tests {
                 call_id: "call-1".to_string(),
                 name: "echo".to_string(),
                 args: json!({"value": 1}),
+                priority: 0,
+                depends_on: Vec::new(),
+                retry_policy: Default::default(),
+                dry_run: false,
             }]),
             AgentAction::Respond {
                 content: "done".to_string(),
@@ -2267,11 +2876,19 @@ mod tests {
                             call_id: "call-1".to_string(),
                             name: "first".to_string(),
                             args: json!({"value": 1}),
+                            priority: 0,
+                            depends_on: Vec::new(),
+                            retry_policy: Default::default(),
+                            dry_run: false,
                         },
                         PlannedSkillCall {
                             call_id: "call-2".to_string(),
                             name: "second".to_string(),
                             args: json!({"value": 2}),
+                            priority: 0,
+                            depends_on: Vec::new(),
+                            retry_policy: Default::default(),
+                            dry_run: false,
                         },
                     ]),
                     usage: None,
@@ -2395,6 +3012,10 @@ mod tests {
                         call_id: "native-1".to_string(),
                         name: "db_fix".to_string(),
                         args: json!({"apply": true}),
+                        priority: 0,
+                        depends_on: Vec::new(),
+                        retry_policy: Default::default(),
+                        dry_run: false,
                     }]),
                     usage: None,
                     cache: None,
@@ -2562,6 +3183,10 @@ mod tests {
                         call_id: "unstable-call".to_string(),
                         name: "unstable".to_string(),
                         args: json!({}),
+                        priority: 0,
+                        depends_on: Vec::new(),
+                        retry_policy: Default::default(),
+                        dry_run: false,
                     }]),
                     usage: None,
                     cache: None,
@@ -2644,5 +3269,321 @@ mod tests {
             .await
             .expect("page");
         assert!(!page.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_are_persisted_without_executor_call() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let llm = Arc::new(MockLlmProvider::dynamic(|input| {
+            if input.context.prior_tool_results.is_empty() {
+                Ok(ProviderDecision {
+                    action: AgentAction::CallSkills(vec![planned(
+                        "bad-args",
+                        "typed_tool",
+                        json!({"value": 1}),
+                    )]),
+                    usage: None,
+                    cache: None,
+                })
+            } else {
+                Ok(ProviderDecision {
+                    action: AgentAction::Respond {
+                        content: "validated".to_string(),
+                    },
+                    usage: None,
+                    cache: None,
+                })
+            }
+        }));
+        let engine = AgentEngine::new(llm, store.clone());
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_for_executor = calls.clone();
+        engine
+            .register_wasm_skill(
+                SkillManifest {
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": {"value": {"type": "string"}}
+                    }),
+                    ..manifest("typed_tool", &["tool:run"])
+                },
+                Arc::new(StubSkillExecutor {
+                    name: "typed",
+                    responder: Arc::new(move |_| {
+                        *calls_for_executor.lock().expect("lock") += 1;
+                        Ok(json!({}))
+                    }),
+                }),
+            )
+            .await;
+
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new("schema-session", message_trigger("run")).with_scope("tool:run"),
+        )
+        .await
+        .expect("outcome");
+
+        assert_eq!(outcome.stop_reason, StopReason::Responded);
+        assert_eq!(*calls.lock().expect("lock"), 0);
+        let snapshot = session(&store, "schema-session").await;
+        assert!(snapshot.records.iter().any(|record| matches!(
+            record,
+            SessionRecord::SkillInputValidation(validation)
+                if !validation.valid && validation.call_id == "bad-args"
+        )));
+        assert!(snapshot.records.iter().any(|record| matches!(
+            record,
+            SessionRecord::ToolResult(result)
+                if result.call_id == "bad-args"
+                    && matches!(
+                        result.output,
+                        Err(SkillFailure {
+                            kind: SkillFailureKind::InvalidArguments,
+                            ..
+                        })
+                    )
+        )));
+    }
+
+    #[tokio::test]
+    async fn checkpointed_graph_resume_executes_only_unfinished_nodes() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let llm = Arc::new(MockLlmProvider::scripted(vec![AgentAction::Respond {
+            content: "done".to_string(),
+        }]));
+        let engine = AgentEngine::new(llm, store.clone());
+        let c1_calls = Arc::new(Mutex::new(0usize));
+        let c2_calls = Arc::new(Mutex::new(0usize));
+        let c1_counter = c1_calls.clone();
+        let c2_counter = c2_calls.clone();
+        engine
+            .register_wasm_skill(
+                manifest("first", &["tool:run"]),
+                Arc::new(StubSkillExecutor {
+                    name: "first",
+                    responder: Arc::new(move |_| {
+                        *c1_counter.lock().expect("lock") += 1;
+                        Ok(json!({"first": true}))
+                    }),
+                }),
+            )
+            .await;
+        engine
+            .register_wasm_skill(
+                manifest("second", &["tool:run"]),
+                Arc::new(StubSkillExecutor {
+                    name: "second",
+                    responder: Arc::new(move |_| {
+                        *c2_counter.lock().expect("lock") += 1;
+                        Ok(json!({"second": true}))
+                    }),
+                }),
+            )
+            .await;
+
+        let trigger_id = "trigger-checkpoint".to_string();
+        let session_id = "checkpoint-session";
+        let trigger = TriggerRecord {
+            trigger_id: trigger_id.clone(),
+            session_id: session_id.to_string(),
+            idempotency_key: None,
+            recorded_at: SystemTime::now(),
+            trigger: message_trigger("resume"),
+        };
+        store.append_trigger(trigger).await.expect("trigger");
+        let calls = vec![
+            planned("call-1", "first", json!({})),
+            planned("call-2", "second", json!({})),
+        ];
+        store
+            .append_model_decision(
+                session_id,
+                ModelDecisionRecord {
+                    step: 0,
+                    decided_at: SystemTime::now(),
+                    action: AgentAction::CallSkills(calls.clone()),
+                },
+            )
+            .await
+            .expect("decision");
+        let graph = existing_or_new_graph(
+            &AgentContext {
+                session_id: session_id.to_string(),
+                records: Vec::new(),
+                prior_tool_results: Vec::new(),
+                granted_scopes: ["tool:run".to_string()].into_iter().collect(),
+                metadata: ExecutionMetadata {
+                    trigger_id: trigger_id.clone(),
+                    idempotency_key: None,
+                    started_at: SystemTime::now(),
+                    deadline: Instant::now() + EnginePolicy::default().max_execution_time(),
+                    policy: EnginePolicy::default(),
+                    provider: Default::default(),
+                    cancellation: Default::default(),
+                },
+            },
+            0,
+            &calls,
+        );
+        store
+            .append_tool_execution_graph(session_id, graph.clone())
+            .await
+            .expect("graph");
+        let first_node = graph.nodes.first().expect("first node");
+        store
+            .append_tool_node_checkpoint(
+                session_id,
+                ToolNodeCheckpointRecord {
+                    checkpoint_id: "cp-start".to_string(),
+                    graph_id: graph.graph_id.clone(),
+                    call_id: first_node.call_id.clone(),
+                    skill_name: first_node.skill_name.clone(),
+                    step: graph.step,
+                    status: ToolNodeStatus::Started,
+                    attempt: 1,
+                    occurred_at: SystemTime::now(),
+                    detail: None,
+                },
+            )
+            .await
+            .expect("started");
+        store
+            .append_tool_node_checkpoint(
+                session_id,
+                ToolNodeCheckpointRecord {
+                    checkpoint_id: "cp-ok".to_string(),
+                    graph_id: graph.graph_id.clone(),
+                    call_id: first_node.call_id.clone(),
+                    skill_name: first_node.skill_name.clone(),
+                    step: graph.step,
+                    status: ToolNodeStatus::Succeeded,
+                    attempt: 1,
+                    occurred_at: SystemTime::now(),
+                    detail: None,
+                },
+            )
+            .await
+            .expect("succeeded");
+        store
+            .append_tool_result(
+                session_id,
+                ToolResultRecord {
+                    call_id: "call-1".to_string(),
+                    finished_at: SystemTime::now(),
+                    skill_name: "first".to_string(),
+                    output: Ok(json!({"already": "done"})),
+                },
+            )
+            .await
+            .expect("result");
+
+        let result = engine
+            .advance(AdvanceRequest::Continue(
+                ContinueRequest::new(session_id).with_scope("tool:run"),
+            ))
+            .await
+            .expect("advance");
+
+        assert!(result.outcome.is_none());
+        assert_eq!(*c1_calls.lock().expect("lock"), 0);
+        assert_eq!(*c2_calls.lock().expect("lock"), 1);
+        let snapshot = session(&store, session_id).await;
+        assert!(snapshot.records.iter().any(|record| matches!(
+            record,
+            SessionRecord::ToolResult(result) if result.call_id == "call-2"
+        )));
+    }
+
+    #[tokio::test]
+    async fn priority_ordering_runs_high_priority_first_when_serialized() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let llm = Arc::new(MockLlmProvider::dynamic(|input| {
+            if input.context.prior_tool_results.is_empty() {
+                let mut low = planned("low", "low", json!({}));
+                low.priority = 0;
+                let mut high = planned("high", "high", json!({}));
+                high.priority = 10;
+                Ok(ProviderDecision {
+                    action: AgentAction::CallSkills(vec![low, high]),
+                    usage: None,
+                    cache: None,
+                })
+            } else {
+                Ok(ProviderDecision {
+                    action: AgentAction::Respond {
+                        content: "ordered".to_string(),
+                    },
+                    usage: None,
+                    cache: None,
+                })
+            }
+        }));
+        let engine = AgentEngine::new(llm, store.clone());
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        for skill_name in ["low", "high"] {
+            let order = order.clone();
+            engine
+                .register_wasm_skill(
+                    manifest(skill_name, &["tool:run"]),
+                    Arc::new(StubSkillExecutor {
+                        name: "ordered",
+                        responder: Arc::new(move |invocation| {
+                            order.lock().expect("lock").push(invocation.call_id);
+                            Ok(json!({}))
+                        }),
+                    }),
+                )
+                .await;
+        }
+
+        let mut policy = EnginePolicy {
+            max_parallel_skill_calls: 1,
+            ..EnginePolicy::default()
+        };
+        policy.self_improvement.enabled = false;
+        run_until_terminal(
+            &engine,
+            ProcessRequest::new("priority-session", message_trigger("run"))
+                .with_scope("tool:run")
+                .with_policy(policy),
+        )
+        .await
+        .expect("outcome");
+
+        assert_eq!(&*order.lock().expect("lock"), &["high", "low"]);
+    }
+
+    #[tokio::test]
+    async fn plan_action_persists_deliberation_record() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let llm = Arc::new(MockLlmProvider::scripted(vec![
+            AgentAction::Plan {
+                summary: "inspect then act".to_string(),
+                candidate_actions: vec!["search memory".to_string(), "call tool".to_string()],
+                confidence: 0.82,
+            },
+            AgentAction::Respond {
+                content: "planned".to_string(),
+            },
+        ]));
+        let engine = AgentEngine::new(llm, store.clone());
+
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new("plan-session", message_trigger("think")),
+        )
+        .await
+        .expect("outcome");
+
+        assert_eq!(outcome.stop_reason, StopReason::Responded);
+        let snapshot = session(&store, "plan-session").await;
+        assert!(snapshot.records.iter().any(|record| matches!(
+            record,
+            SessionRecord::Deliberation(deliberation)
+                if deliberation.summary == "inspect then act"
+                    && deliberation.outcome == DeliberationOutcome::ReadyToAct
+        )));
     }
 }

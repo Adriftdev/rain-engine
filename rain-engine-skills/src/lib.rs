@@ -23,6 +23,10 @@ fn base_manifest(name: &str, description: &str, input_schema: serde_json::Value)
             timeout_ms: 30_000,
             max_memory_bytes: 16 * 1024 * 1024,
             max_fuel: None,
+            priority_class: 0,
+            max_retries: 0,
+            retry_backoff_ms: 250,
+            dry_run_supported: false,
         },
         approval_required: false,
     }

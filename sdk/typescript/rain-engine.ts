@@ -122,6 +122,10 @@ export type SessionRecord =
 	| { type: "Trigger", payload: TriggerRecord }
 	| { type: "KernelEvent", payload: KernelEventRecord }
 	| { type: "ModelDecision", payload: ModelDecisionRecord }
+	| { type: "Deliberation", payload: DeliberationRecord }
+	| { type: "ToolExecutionGraph", payload: ToolExecutionGraph }
+	| { type: "ToolNodeCheckpoint", payload: ToolNodeCheckpointRecord }
+	| { type: "SkillInputValidation", payload: SkillInputValidationRecord }
 	| { type: "ToolCall", payload: ToolCallRecord }
 	| { type: "ToolResult", payload: ToolResultRecord }
 	| { type: "PendingApproval", payload: PendingApprovalRecord }
@@ -142,6 +146,82 @@ export interface ToolResultRecord {
 	finished_at: string;
 	skill_name: string;
 	output: Result<unknown, SkillFailure>;
+}
+
+export interface ToolRetryPolicy {
+	max_retries: number;
+	retry_backoff_ms: number;
+}
+
+export interface ToolDependency {
+	call_id: string;
+}
+
+export interface ToolNode {
+	call_id: string;
+	skill_name: string;
+	args: unknown;
+	priority: number;
+	dependencies: ToolDependency[];
+	retry_policy: ToolRetryPolicy;
+	dry_run: boolean;
+	provider_order: number;
+}
+
+export interface ToolExecutionGraph {
+	graph_id: string;
+	trigger_id: string;
+	step: number;
+	created_at: string;
+	nodes: ToolNode[];
+}
+
+export enum ToolNodeStatus {
+	Queued = "Queued",
+	Validated = "Validated",
+	Started = "Started",
+	Succeeded = "Succeeded",
+	Failed = "Failed",
+	Skipped = "Skipped",
+	TimedOut = "TimedOut",
+}
+
+export interface ToolNodeCheckpointRecord {
+	checkpoint_id: string;
+	graph_id: string;
+	call_id: string;
+	skill_name: string;
+	step: number;
+	status: ToolNodeStatus;
+	attempt: number;
+	occurred_at: string;
+	detail?: string;
+}
+
+export interface SkillInputValidationRecord {
+	validation_id: string;
+	graph_id: string;
+	call_id: string;
+	skill_name: string;
+	validated_at: string;
+	valid: boolean;
+	errors: string[];
+}
+
+export enum DeliberationOutcome {
+	NeedsRefinement = "NeedsRefinement",
+	ReadyToAct = "ReadyToAct",
+}
+
+export interface DeliberationRecord {
+	deliberation_id: string;
+	trigger_id: string;
+	step: number;
+	created_at: string;
+	summary: string;
+	candidate_actions: string[];
+	confidence: number;
+	outcome: DeliberationOutcome;
 }
 
 export interface MemoryPolicy {
@@ -303,6 +383,10 @@ export interface EnginePolicy {
 	max_parallel_skill_calls: number;
 	max_inline_attachment_bytes: number;
 	allow_native_skills: boolean;
+	validate_tool_args: boolean;
+	max_ready_tool_nodes: number;
+	max_tool_retries_per_step: number;
+	enable_tool_dry_run: boolean;
 	self_improvement: SelfImprovementPolicy;
 }
 
@@ -402,6 +486,11 @@ export interface HumanInputIngressRequest {
 }
 
 export type AgentAction = 
+	| { type: "Plan", payload: {
+	summary: string;
+	candidate_actions: string[];
+	confidence: number;
+}}
 	| { type: "Respond", payload: {
 	content: string;
 }}
@@ -434,6 +523,10 @@ export enum SessionRecordKind {
 	Trigger = "trigger",
 	KernelEvent = "kernel_event",
 	ModelDecision = "model_decision",
+	Deliberation = "deliberation",
+	ToolExecutionGraph = "tool_execution_graph",
+	ToolNodeCheckpoint = "tool_node_checkpoint",
+	SkillInputValidation = "skill_input_validation",
 	ToolCall = "tool_call",
 	ToolResult = "tool_result",
 	PendingApproval = "pending_approval",
@@ -482,6 +575,10 @@ export interface PlannedSkillCall {
 	call_id: string;
 	name: string;
 	args: unknown;
+	priority: number;
+	depends_on: string[];
+	retry_policy: ToolRetryPolicy;
+	dry_run: boolean;
 }
 
 export interface PendingApprovalRecord {
@@ -693,6 +790,10 @@ export interface ResourcePolicy {
 	timeout_ms: number;
 	max_memory_bytes: number;
 	max_fuel?: number;
+	priority_class: number;
+	max_retries: number;
+	retry_backoff_ms: number;
+	dry_run_supported: boolean;
 }
 
 export interface SkillManifest {

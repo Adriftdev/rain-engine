@@ -47,6 +47,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             call_id: "call-1".to_string(),
             name: EchoInput::skill_manifest().name,
             args: json!({"value": "hello"}),
+            priority: 0,
+            depends_on: Vec::new(),
+            retry_policy: Default::default(),
+            dry_run: false,
         }]),
         AgentAction::Respond {
             content: "completed".to_string(),

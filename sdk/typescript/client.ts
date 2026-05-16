@@ -34,11 +34,16 @@ import type {
   PolicyTuningRecord,
   ProfilePatchRecord,
   ReflectionRecord,
+  DeliberationOutcome,
+  SkillInputValidationRecord,
   PlannedSkillCall,
   SkillDefinition,
   StopReason,
   StrategyPreferenceRecord,
   ToolCallRecord,
+  ToolExecutionGraph,
+  ToolNodeCheckpointRecord,
+  ToolNodeStatus,
   ToolPerformanceRecord,
   ToolResultRecord,
 } from './rain-engine';
@@ -116,6 +121,14 @@ export interface SelfImprovementView {
   profile_patches: ProfilePatchRecord[];
 }
 
+export interface ExecutionGraphView {
+  active_graph?: ToolExecutionGraph;
+  graphs: ToolExecutionGraph[];
+  checkpoints: ToolNodeCheckpointRecord[];
+  validations: SkillInputValidationRecord[];
+  blocked_call_ids: string[];
+}
+
 export type TimelineItem =
   | { type: 'HumanInput'; payload: { actor_id: string; content: string; occurred_at_ms: number } }
   | { type: 'AssistantResponse'; payload: { content: string; stop_reason: StopReason; occurred_at_ms: number } }
@@ -123,6 +136,9 @@ export type TimelineItem =
   | { type: 'ToolResult'; payload: { call_id: string; skill_name: string; success: boolean; preview: string; occurred_at_ms: number } }
   | { type: 'ApprovalRequested'; payload: { resume_token: string; pending_calls: PlannedSkillCall[]; occurred_at_ms: number } }
   | { type: 'ApprovalResolved'; payload: { resume_token: string; decision: string; occurred_at_ms: number } }
+  | { type: 'Plan'; payload: { summary: string; candidate_actions: string[]; confidence: number; outcome: DeliberationOutcome; occurred_at_ms: number } }
+  | { type: 'ToolCheckpoint'; payload: { call_id: string; skill_name: string; status: ToolNodeStatus; attempt: number; detail?: string; occurred_at_ms: number } }
+  | { type: 'ValidationFailure'; payload: { call_id: string; skill_name: string; errors: string[]; occurred_at_ms: number } }
   | { type: 'Learning'; payload: { label: string; detail: string; confidence: number; occurred_at_ms: number } }
   | { type: 'System'; payload: { label: string; detail: string; occurred_at_ms: number } };
 
@@ -136,6 +152,7 @@ export interface SessionView {
   timeline: TimelineItem[];
   tool_timeline: ToolTimelineItem[];
   self_improvement: SelfImprovementView;
+  execution_graph: ExecutionGraphView;
   record_count: number;
   total_estimated_cost_usd: number;
 }
@@ -336,6 +353,10 @@ export class RainEngineClient {
     return this.get(`sessions/${encodeURIComponent(sessionId)}/view`);
   }
 
+  async getExecutionGraph(sessionId: string): Promise<ExecutionGraphView> {
+    return this.get(`sessions/${encodeURIComponent(sessionId)}/execution-graph`);
+  }
+
   /**
    * Read gateway capabilities and registered tool manifests.
    * Route: `GET /capabilities`
@@ -532,6 +553,48 @@ export function toTranscriptItems(records: SessionRecord[]): TimelineItem[] {
           resume_token: approval.resume_token,
           pending_calls: approval.pending_calls,
           occurred_at_ms: Date.parse(approval.created_at),
+        },
+      }];
+    }
+
+    if (record.type === 'Deliberation') {
+      const deliberation = record.payload as any;
+      return [{
+        type: 'Plan',
+        payload: {
+          summary: deliberation.summary,
+          candidate_actions: deliberation.candidate_actions ?? [],
+          confidence: deliberation.confidence ?? 0,
+          outcome: deliberation.outcome,
+          occurred_at_ms: Date.parse(deliberation.created_at),
+        },
+      }];
+    }
+
+    if (record.type === 'ToolNodeCheckpoint') {
+      const checkpoint = record.payload as ToolNodeCheckpointRecord;
+      return [{
+        type: 'ToolCheckpoint',
+        payload: {
+          call_id: checkpoint.call_id,
+          skill_name: checkpoint.skill_name,
+          status: checkpoint.status,
+          attempt: checkpoint.attempt,
+          detail: checkpoint.detail,
+          occurred_at_ms: Date.parse(checkpoint.occurred_at),
+        },
+      }];
+    }
+
+    if (record.type === 'SkillInputValidation') {
+      const validation = record.payload as SkillInputValidationRecord;
+      return validation.valid ? [] : [{
+        type: 'ValidationFailure',
+        payload: {
+          call_id: validation.call_id,
+          skill_name: validation.skill_name,
+          errors: validation.errors,
+          occurred_at_ms: Date.parse(validation.validated_at),
         },
       }];
     }

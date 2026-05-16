@@ -303,6 +303,10 @@ impl LlmProvider for GeminiProvider {
                         .unwrap_or_else(|| format!("gemini-call-{index}")),
                     name: function_call.name,
                     args: function_call.args.unwrap_or_else(|| json!({})),
+                    priority: 0,
+                    depends_on: Vec::new(),
+                    retry_policy: Default::default(),
+                    dry_run: false,
                 });
             } else if let Some(text) = part.text {
                 text_parts.push(text);

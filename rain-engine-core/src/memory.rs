@@ -1,10 +1,11 @@
 use crate::{
-    ApprovalResolutionRecord, CoordinationClaimRecord, DelegationRecord, EngineOutcome,
-    KernelEventRecord, ModelDecisionRecord, NewSessionRecord, OutcomeRecord, PendingApprovalRecord,
-    PolicyTuningRecord, ProfilePatchRecord, ProviderCacheRecord, ProviderUsageRecord, RecordPage,
-    RecordPageQuery, ReflectionRecord, SessionListQuery, SessionRecord, SessionSnapshot,
-    SessionSummary, StoredSessionRecord, StrategyPreferenceRecord, ToolCallRecord,
-    ToolPerformanceRecord, ToolResultRecord, TriggerRecord,
+    ApprovalResolutionRecord, CoordinationClaimRecord, DelegationRecord, DeliberationRecord,
+    EngineOutcome, KernelEventRecord, ModelDecisionRecord, NewSessionRecord, OutcomeRecord,
+    PendingApprovalRecord, PolicyTuningRecord, ProfilePatchRecord, ProviderCacheRecord,
+    ProviderUsageRecord, RecordPage, RecordPageQuery, ReflectionRecord, SessionListQuery,
+    SessionRecord, SessionSnapshot, SessionSummary, SkillInputValidationRecord,
+    StoredSessionRecord, StrategyPreferenceRecord, ToolCallRecord, ToolExecutionGraph,
+    ToolNodeCheckpointRecord, ToolPerformanceRecord, ToolResultRecord, TriggerRecord,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -76,6 +77,54 @@ pub trait MemoryStoreExt: MemoryStore {
         self.append_record(NewSessionRecord::from_record(
             session_id.to_string(),
             SessionRecord::ModelDecision(record),
+        ))
+        .await
+    }
+
+    async fn append_deliberation(
+        &self,
+        session_id: &str,
+        record: DeliberationRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::Deliberation(record),
+        ))
+        .await
+    }
+
+    async fn append_tool_execution_graph(
+        &self,
+        session_id: &str,
+        record: ToolExecutionGraph,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::ToolExecutionGraph(record),
+        ))
+        .await
+    }
+
+    async fn append_tool_node_checkpoint(
+        &self,
+        session_id: &str,
+        record: ToolNodeCheckpointRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::ToolNodeCheckpoint(record),
+        ))
+        .await
+    }
+
+    async fn append_skill_input_validation(
+        &self,
+        session_id: &str,
+        record: SkillInputValidationRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::SkillInputValidation(record),
         ))
         .await
     }

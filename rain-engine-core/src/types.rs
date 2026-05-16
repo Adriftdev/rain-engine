@@ -495,6 +495,117 @@ pub struct PlannedSkillCall {
     pub call_id: String,
     pub name: String,
     pub args: Value,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub retry_policy: ToolRetryPolicy,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolRetryPolicy {
+    pub max_retries: usize,
+    pub retry_backoff_ms: u64,
+}
+
+impl Default for ToolRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            retry_backoff_ms: 250,
+        }
+    }
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolDependency {
+    pub call_id: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolNode {
+    pub call_id: String,
+    pub skill_name: String,
+    pub args: Value,
+    pub priority: i32,
+    pub dependencies: Vec<ToolDependency>,
+    pub retry_policy: ToolRetryPolicy,
+    pub dry_run: bool,
+    pub provider_order: usize,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolExecutionGraph {
+    pub graph_id: String,
+    pub trigger_id: String,
+    pub step: usize,
+    pub created_at: SystemTime,
+    pub nodes: Vec<ToolNode>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolNodeStatus {
+    Queued,
+    Validated,
+    Started,
+    Succeeded,
+    Failed,
+    Skipped,
+    TimedOut,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolNodeCheckpointRecord {
+    pub checkpoint_id: String,
+    pub graph_id: String,
+    pub call_id: String,
+    pub skill_name: String,
+    pub step: usize,
+    pub status: ToolNodeStatus,
+    pub attempt: usize,
+    pub occurred_at: SystemTime,
+    pub detail: Option<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillInputValidationRecord {
+    pub validation_id: String,
+    pub graph_id: String,
+    pub call_id: String,
+    pub skill_name: String,
+    pub validated_at: SystemTime,
+    pub valid: bool,
+    pub errors: Vec<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeliberationRecord {
+    pub deliberation_id: String,
+    pub trigger_id: String,
+    pub step: usize,
+    pub created_at: SystemTime,
+    pub summary: String,
+    pub candidate_actions: Vec<String>,
+    pub confidence: f64,
+    pub outcome: DeliberationOutcome,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DeliberationOutcome {
+    NeedsRefinement,
+    ReadyToAct,
 }
 
 #[typeshare::typeshare]
@@ -509,6 +620,11 @@ pub enum SuspendReason {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum AgentAction {
+    Plan {
+        summary: String,
+        candidate_actions: Vec<String>,
+        confidence: f64,
+    },
     Respond {
         content: String,
     },
@@ -546,6 +662,14 @@ pub struct ResourcePolicy {
     pub timeout_ms: u64,
     pub max_memory_bytes: usize,
     pub max_fuel: Option<u64>,
+    #[serde(default)]
+    pub priority_class: i32,
+    #[serde(default)]
+    pub max_retries: usize,
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    #[serde(default)]
+    pub dry_run_supported: bool,
 }
 
 impl ResourcePolicy {
@@ -554,6 +678,10 @@ impl ResourcePolicy {
             timeout_ms: 5_000,
             max_memory_bytes: 8 * 1024 * 1024,
             max_fuel: Some(10_000_000),
+            priority_class: 0,
+            max_retries: 0,
+            retry_backoff_ms: default_retry_backoff_ms(),
+            dry_run_supported: false,
         }
     }
 
@@ -562,8 +690,16 @@ impl ResourcePolicy {
             timeout_ms: self.timeout_ms.max(1),
             max_memory_bytes: self.max_memory_bytes.max(64 * 1024),
             max_fuel: self.max_fuel,
+            priority_class: self.priority_class,
+            max_retries: self.max_retries,
+            retry_backoff_ms: self.retry_backoff_ms.max(1),
+            dry_run_supported: self.dry_run_supported,
         }
     }
+}
+
+fn default_retry_backoff_ms() -> u64 {
+    250
 }
 
 #[typeshare::typeshare]
@@ -632,6 +768,7 @@ pub struct ToolCallRecord {
 pub enum SkillFailureKind {
     PermissionDenied,
     CapabilityDenied,
+    InvalidArguments,
     Timeout,
     MemoryLimitExceeded,
     Trap,
@@ -923,6 +1060,10 @@ pub enum SessionRecord {
     Trigger(TriggerRecord),
     KernelEvent(KernelEventRecord),
     ModelDecision(ModelDecisionRecord),
+    Deliberation(DeliberationRecord),
+    ToolExecutionGraph(ToolExecutionGraph),
+    ToolNodeCheckpoint(ToolNodeCheckpointRecord),
+    SkillInputValidation(SkillInputValidationRecord),
     ToolCall(ToolCallRecord),
     ToolResult(ToolResultRecord),
     PendingApproval(PendingApprovalRecord),
@@ -946,6 +1087,10 @@ pub enum SessionRecordKind {
     Trigger,
     KernelEvent,
     ModelDecision,
+    Deliberation,
+    ToolExecutionGraph,
+    ToolNodeCheckpoint,
+    SkillInputValidation,
     ToolCall,
     ToolResult,
     PendingApproval,
@@ -968,6 +1113,10 @@ impl SessionRecordKind {
             SessionRecordKind::Trigger => "trigger",
             SessionRecordKind::KernelEvent => "kernel_event",
             SessionRecordKind::ModelDecision => "model_decision",
+            SessionRecordKind::Deliberation => "deliberation",
+            SessionRecordKind::ToolExecutionGraph => "tool_execution_graph",
+            SessionRecordKind::ToolNodeCheckpoint => "tool_node_checkpoint",
+            SessionRecordKind::SkillInputValidation => "skill_input_validation",
             SessionRecordKind::ToolCall => "tool_call",
             SessionRecordKind::ToolResult => "tool_result",
             SessionRecordKind::PendingApproval => "pending_approval",
@@ -990,6 +1139,10 @@ impl SessionRecordKind {
             "trigger" => Some(SessionRecordKind::Trigger),
             "kernel_event" => Some(SessionRecordKind::KernelEvent),
             "model_decision" => Some(SessionRecordKind::ModelDecision),
+            "deliberation" => Some(SessionRecordKind::Deliberation),
+            "tool_execution_graph" => Some(SessionRecordKind::ToolExecutionGraph),
+            "tool_node_checkpoint" => Some(SessionRecordKind::ToolNodeCheckpoint),
+            "skill_input_validation" => Some(SessionRecordKind::SkillInputValidation),
             "tool_call" => Some(SessionRecordKind::ToolCall),
             "tool_result" => Some(SessionRecordKind::ToolResult),
             "pending_approval" => Some(SessionRecordKind::PendingApproval),
@@ -1015,6 +1168,10 @@ impl SessionRecord {
             SessionRecord::Trigger(_) => SessionRecordKind::Trigger,
             SessionRecord::KernelEvent(_) => SessionRecordKind::KernelEvent,
             SessionRecord::ModelDecision(_) => SessionRecordKind::ModelDecision,
+            SessionRecord::Deliberation(_) => SessionRecordKind::Deliberation,
+            SessionRecord::ToolExecutionGraph(_) => SessionRecordKind::ToolExecutionGraph,
+            SessionRecord::ToolNodeCheckpoint(_) => SessionRecordKind::ToolNodeCheckpoint,
+            SessionRecord::SkillInputValidation(_) => SessionRecordKind::SkillInputValidation,
             SessionRecord::ToolCall(_) => SessionRecordKind::ToolCall,
             SessionRecord::ToolResult(_) => SessionRecordKind::ToolResult,
             SessionRecord::PendingApproval(_) => SessionRecordKind::PendingApproval,
@@ -1037,6 +1194,10 @@ impl SessionRecord {
             SessionRecord::Trigger(record) => record.recorded_at,
             SessionRecord::KernelEvent(record) => record.occurred_at,
             SessionRecord::ModelDecision(record) => record.decided_at,
+            SessionRecord::Deliberation(record) => record.created_at,
+            SessionRecord::ToolExecutionGraph(record) => record.created_at,
+            SessionRecord::ToolNodeCheckpoint(record) => record.occurred_at,
+            SessionRecord::SkillInputValidation(record) => record.validated_at,
             SessionRecord::ToolCall(record) => record.called_at,
             SessionRecord::ToolResult(record) => record.finished_at,
             SessionRecord::PendingApproval(record) => record.created_at,
@@ -1057,6 +1218,8 @@ impl SessionRecord {
     pub fn trigger_id(&self) -> Option<&str> {
         match self {
             SessionRecord::Trigger(record) => Some(&record.trigger_id),
+            SessionRecord::Deliberation(record) => Some(&record.trigger_id),
+            SessionRecord::ToolExecutionGraph(record) => Some(&record.trigger_id),
             SessionRecord::PendingApproval(record) => Some(&record.trigger_id),
             SessionRecord::Delegation(record) => Some(&record.trigger_id),
             SessionRecord::Reflection(record) => Some(&record.trigger_id),
@@ -1228,6 +1391,83 @@ impl SessionSnapshot {
             .collect()
     }
 
+    pub fn deliberations(&self) -> Vec<DeliberationRecord> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::Deliberation(deliberation) => Some(deliberation.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn tool_execution_graphs(&self) -> Vec<ToolExecutionGraph> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::ToolExecutionGraph(graph) => Some(graph.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn tool_node_checkpoints(&self) -> Vec<ToolNodeCheckpointRecord> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::ToolNodeCheckpoint(checkpoint) => Some(checkpoint.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn skill_input_validations(&self) -> Vec<SkillInputValidationRecord> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::SkillInputValidation(validation) => Some(validation.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn active_tool_execution_graph(&self) -> Option<ToolExecutionGraph> {
+        let outcome_index = self
+            .records
+            .iter()
+            .rposition(|record| matches!(record, SessionRecord::Outcome(_)));
+        let slice = match outcome_index {
+            Some(index) => &self.records[index + 1..],
+            None => &self.records[..],
+        };
+
+        let graph = slice.iter().rev().find_map(|record| match record {
+            SessionRecord::ToolExecutionGraph(graph) => Some(graph.clone()),
+            _ => None,
+        })?;
+
+        let terminal = slice
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::ToolNodeCheckpoint(checkpoint)
+                    if checkpoint.graph_id == graph.graph_id
+                        && matches!(
+                            checkpoint.status,
+                            ToolNodeStatus::Succeeded
+                                | ToolNodeStatus::Failed
+                                | ToolNodeStatus::Skipped
+                                | ToolNodeStatus::TimedOut
+                        ) =>
+                {
+                    Some(checkpoint.call_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+
+        (terminal.len() < graph.nodes.len()).then_some(graph)
+    }
+
     pub fn active_trigger(&self) -> Option<TriggerRecord> {
         let outcome_index = self
             .records
@@ -1254,7 +1494,12 @@ impl SessionSnapshot {
         };
         slice
             .iter()
-            .filter(|record| matches!(record, SessionRecord::ModelDecision(_)))
+            .filter(|record| {
+                matches!(
+                    record,
+                    SessionRecord::ModelDecision(_) | SessionRecord::Deliberation(_)
+                )
+            })
             .count()
     }
 
@@ -1276,6 +1521,12 @@ impl SessionSnapshot {
             match record {
                 SessionRecord::ModelDecision(decision) => {
                     if let Some(action) = current_action.replace(decision.action.clone()) {
+                        windows.push((action, current_results));
+                        current_results = Vec::new();
+                    }
+                }
+                SessionRecord::Deliberation(_) => {
+                    if let Some(action) = current_action.take() {
                         windows.push((action, current_results));
                         current_results = Vec::new();
                     }
@@ -1487,6 +1738,14 @@ pub struct EnginePolicy {
     pub max_parallel_skill_calls: usize,
     pub max_inline_attachment_bytes: usize,
     pub allow_native_skills: bool,
+    #[serde(default = "default_validate_tool_args")]
+    pub validate_tool_args: bool,
+    #[serde(default = "default_max_ready_tool_nodes")]
+    pub max_ready_tool_nodes: usize,
+    #[serde(default = "default_max_tool_retries_per_step")]
+    pub max_tool_retries_per_step: usize,
+    #[serde(default)]
+    pub enable_tool_dry_run: bool,
     #[serde(default)]
     pub self_improvement: SelfImprovementPolicy,
 }
@@ -1504,9 +1763,25 @@ impl Default for EnginePolicy {
             max_parallel_skill_calls: 4,
             max_inline_attachment_bytes: 512 * 1024,
             allow_native_skills: true,
+            validate_tool_args: default_validate_tool_args(),
+            max_ready_tool_nodes: default_max_ready_tool_nodes(),
+            max_tool_retries_per_step: default_max_tool_retries_per_step(),
+            enable_tool_dry_run: false,
             self_improvement: SelfImprovementPolicy::default(),
         }
     }
+}
+
+fn default_validate_tool_args() -> bool {
+    true
+}
+
+fn default_max_ready_tool_nodes() -> usize {
+    64
+}
+
+fn default_max_tool_retries_per_step() -> usize {
+    2
 }
 
 impl EnginePolicy {
@@ -1743,6 +2018,7 @@ pub struct SkillInvocation {
     pub manifest: SkillManifest,
     pub args: Value,
     pub context: AgentContextSnapshot,
+    pub dry_run: bool,
 }
 
 #[typeshare::typeshare]

@@ -66,7 +66,18 @@ flowchart TD
 `AgentEngine::advance(AdvanceRequest)` is the only core execution primitive. It
 loads session history, applies one trigger or continuation, persists derived
 kernel events, asks the provider at most once, executes at most one planned tool
-batch, persists the resulting records, and returns an `AdvanceResult`.
+graph, persists the resulting records, and returns an `AdvanceResult`.
+
+Tool execution is checkpointed. `CallSkills` decisions are materialized as a
+`ToolExecutionGraph`; each node records queued, validated, started, and terminal
+checkpoints. On continuation after interruption, the kernel replays the ledger
+and resumes unfinished nodes instead of repeating completed work. Tool arguments
+are validated against each skill manifest before execution, and invalid inputs
+become structured tool results.
+
+Deliberation is auditable rather than hidden. Providers may emit `Plan` actions
+with concise summaries, candidate actions, and confidence. Those records can be
+refined across advance calls, but the ledger remains the source of truth.
 
 Convenience loops belong outside the kernel. The reference runtime exposes
 `run_until_terminal(...)`, and ingress workers use the same pattern when
@@ -98,7 +109,8 @@ over server-sent events, and renders the ledger as a live workbench:
 
 - session status, provider capabilities, and registered tools
 - human input and assistant outcomes
-- tool calls, tool results, and failure details
+- reasoning plans, tool execution graphs, checkpoints, validation failures, and
+  tool results
 - approval checkpoints with exact arguments and structured approve/deny actions
 - learning events, active policy overlays, reflections, and rollback history
 - projected goals, tasks, observations, artifacts, and raw records

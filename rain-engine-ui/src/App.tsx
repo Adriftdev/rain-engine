@@ -157,7 +157,7 @@ function SessionWorkbench(props: {
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [approvalReason, setApprovalReason] = createSignal('');
-  const [activeTab, setActiveTab] = createSignal<'timeline' | 'state' | 'tools' | 'learning' | 'raw'>('timeline');
+  const [activeTab, setActiveTab] = createSignal<'timeline' | 'state' | 'tools' | 'graph' | 'learning' | 'raw'>('timeline');
 
   createEffect(() => {
     const sessionId = props.sessionId;
@@ -355,6 +355,18 @@ function TimelineRow(props: { item: TimelineItem }) {
     return <CenterEvent tone="neutral" title="Checkpoint Resolved" detail={payload().decision} />;
   }
 
+  if (props.item.type === 'Plan') {
+    return <CenterEvent tone="indigo" title={`Reasoning Plan · ${(payload().confidence * 100).toFixed(0)}%`} detail={payload().summary} />;
+  }
+
+  if (props.item.type === 'ToolCheckpoint') {
+    return <CenterEvent tone={payload().status === 'Succeeded' ? 'success' : payload().status === 'Failed' || payload().status === 'TimedOut' ? 'danger' : 'neutral'} title={`Checkpoint · ${payload().status}`} detail={`${payload().skill_name} · attempt ${payload().attempt}`} />;
+  }
+
+  if (props.item.type === 'ValidationFailure') {
+    return <CenterEvent tone="danger" title="Schema Rejected" detail={`${payload().skill_name}: ${payload().errors.join(', ')}`} />;
+  }
+
   if (props.item.type === 'Learning') {
     return <CenterEvent tone="indigo" title={`Learning · ${(payload().confidence * 100).toFixed(0)}%`} detail={payload().detail} />;
   }
@@ -471,17 +483,17 @@ function Composer(props: {
 function Inspector(props: {
   view: SessionView | null;
   capabilities?: RuntimeCapabilities;
-  activeTab: 'timeline' | 'state' | 'tools' | 'learning' | 'raw';
-  onTab: (tab: 'timeline' | 'state' | 'tools' | 'learning' | 'raw') => void;
+  activeTab: 'timeline' | 'state' | 'tools' | 'graph' | 'learning' | 'raw';
+  onTab: (tab: 'timeline' | 'state' | 'tools' | 'graph' | 'learning' | 'raw') => void;
 }) {
-  const tabs = ['timeline', 'state', 'tools', 'learning', 'raw'] as const;
+  const tabs = ['timeline', 'state', 'tools', 'graph', 'learning', 'raw'] as const;
   return (
     <aside class={inspectorClass}>
       <div class={css({ p: '24px', borderBottom: '1px solid', borderColor: 'border.default' })}>
         <div class={css({ fontSize: '13px', fontWeight: '900', letterSpacing: '0.1em', textTransform: 'uppercase', color: 'fg.default' })}>Inspector</div>
       </div>
 
-      <div class={css({ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', px: '4px', pt: '4px' })}>
+      <div class={css({ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', px: '4px', pt: '4px' })}>
         <For each={tabs}>
           {(tab) => (
             <button class={cx(tabButtonClass, props.activeTab === tab ? activeTabButtonClass : '')} onClick={() => props.onTab(tab)}>
@@ -503,6 +515,9 @@ function Inspector(props: {
               </Show>
               <Show when={props.activeTab === 'tools'}>
                 <ToolsPanel view={view()} capabilities={props.capabilities} />
+              </Show>
+              <Show when={props.activeTab === 'graph'}>
+                <ExecutionGraphPanel view={view()} />
               </Show>
               <Show when={props.activeTab === 'learning'}>
                 <LearningPanel view={view()} />
@@ -580,6 +595,68 @@ function ToolsPanel(props: { view: SessionView; capabilities?: RuntimeCapabiliti
             </div>
           )}
         </For>
+      </Show>
+    </div>
+  );
+}
+
+function ExecutionGraphPanel(props: { view: SessionView }) {
+  const graph = () => props.view.execution_graph;
+  const latestStatus = createMemo(() => {
+    const map = new Map<string, string>();
+    for (const checkpoint of graph().checkpoints) {
+      map.set(checkpoint.call_id, checkpoint.status);
+    }
+    return map;
+  });
+  const validationFailures = createMemo(() => graph().validations.filter((validation) => !validation.valid));
+
+  return (
+    <div class={css({ display: 'flex', flexDir: 'column', gap: '16px' })}>
+      <div class={css({ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' })}>
+        <MetricCard label="Graphs" value={String(graph().graphs.length)} />
+        <MetricCard label="Checkpoints" value={String(graph().checkpoints.length)} />
+      </div>
+
+      <Show when={graph().active_graph} fallback={<PanelNote>No active execution graph.</PanelNote>}>
+        {(active) => (
+          <div class={panelCardClass}>
+            <div class={panelLabelClass}>Active Graph</div>
+            <div class={css({ mt: '8px', fontSize: '11px', fontFamily: 'var(--font-mono)', color: 'fg.muted' })}>{active().graph_id}</div>
+            <div class={css({ mt: '12px', display: 'flex', flexDir: 'column', gap: '8px' })}>
+              <For each={active().nodes}>
+                {(node) => {
+                  const status = () => latestStatus().get(node.call_id) ?? 'Queued';
+                  return (
+                    <div class={css({ p: '12px', borderRadius: '12px', bg: 'white/4', border: '1px solid', borderColor: graph().blocked_call_ids.includes(node.call_id) ? 'red.500/40' : 'white/8' })}>
+                      <div class={css({ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' })}>
+                        <span class={css({ fontWeight: '900', fontSize: '12px' })}>{node.skill_name}</span>
+                        <span class={css({ fontSize: '9px', fontWeight: '900', textTransform: 'uppercase', color: status() === 'Succeeded' ? 'green.400' : status() === 'Failed' || status() === 'TimedOut' ? 'red.400' : 'fg.muted' })}>{status()}</span>
+                      </div>
+                      <div class={css({ mt: '6px', fontSize: '10px', color: 'fg.muted' })}>
+                        priority {node.priority} · depends on {node.dependencies.length || 'none'} · retries {node.retry_policy.max_retries}
+                      </div>
+                    </div>
+                  );
+                }}
+              </For>
+            </div>
+          </div>
+        )}
+      </Show>
+
+      <Show when={validationFailures().length > 0}>
+        <div class={panelCardClass}>
+          <div class={panelLabelClass}>Validation Failures</div>
+          <For each={validationFailures()}>
+            {(failure) => (
+              <div class={learningItemClass}>
+                <div class={css({ fontWeight: '900', fontSize: '12px', color: 'red.400' })}>{failure.skill_name}</div>
+                <div class={css({ mt: '4px', fontSize: '11px', color: 'fg.muted', lineHeight: '1.5' })}>{failure.errors.join(', ')}</div>
+              </div>
+            )}
+          </For>
+        </div>
       </Show>
     </div>
   );

@@ -18,6 +18,7 @@ export {
 } from './client';
 export type {
   ApprovalView,
+  ExecutionGraphView,
   RainEngineClientOptions,
   RuntimeCapabilities,
   SelfImprovementView,

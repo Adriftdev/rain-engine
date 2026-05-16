@@ -165,6 +165,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         .unwrap_or_else(|| format!("openai-call-{index}")),
                     name: tool_call.function.name,
                     args,
+                    priority: 0,
+                    depends_on: Vec::new(),
+                    retry_policy: Default::default(),
+                    dry_run: false,
                 });
             }
             return Ok(ProviderDecision {
@@ -522,11 +526,19 @@ mod tests {
                     call_id: "call-1".to_string(),
                     name: "echo".to_string(),
                     args: json!({"value": 1}),
+                    priority: 0,
+                    depends_on: Vec::new(),
+                    retry_policy: Default::default(),
+                    dry_run: false,
                 },
                 PlannedSkillCall {
                     call_id: "call-2".to_string(),
                     name: "echo".to_string(),
                     args: json!({"value": 2}),
+                    priority: 0,
+                    depends_on: Vec::new(),
+                    retry_policy: Default::default(),
+                    dry_run: false,
                 },
             ])
         );

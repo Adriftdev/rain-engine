@@ -287,6 +287,16 @@ pub struct SelfImprovementView {
 
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionGraphView {
+    pub active_graph: Option<rain_engine_core::ToolExecutionGraph>,
+    pub graphs: Vec<rain_engine_core::ToolExecutionGraph>,
+    pub checkpoints: Vec<rain_engine_core::ToolNodeCheckpointRecord>,
+    pub validations: Vec<rain_engine_core::SkillInputValidationRecord>,
+    pub blocked_call_ids: Vec<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum TimelineItem {
     HumanInput {
@@ -322,6 +332,27 @@ pub enum TimelineItem {
         decision: ApprovalDecision,
         occurred_at_ms: i64,
     },
+    Plan {
+        summary: String,
+        candidate_actions: Vec<String>,
+        confidence: f64,
+        outcome: rain_engine_core::DeliberationOutcome,
+        occurred_at_ms: i64,
+    },
+    ToolCheckpoint {
+        call_id: String,
+        skill_name: String,
+        status: rain_engine_core::ToolNodeStatus,
+        attempt: usize,
+        detail: Option<String>,
+        occurred_at_ms: i64,
+    },
+    ValidationFailure {
+        call_id: String,
+        skill_name: String,
+        errors: Vec<String>,
+        occurred_at_ms: i64,
+    },
     Learning {
         label: String,
         detail: String,
@@ -347,6 +378,7 @@ pub struct SessionView {
     pub timeline: Vec<TimelineItem>,
     pub tool_timeline: Vec<ToolTimelineItem>,
     pub self_improvement: SelfImprovementView,
+    pub execution_graph: ExecutionGraphView,
     pub record_count: usize,
     pub total_estimated_cost_usd: f64,
 }
@@ -538,6 +570,10 @@ pub fn app(state: RuntimeState) -> Router {
         .route("/sessions", get(handle_list_sessions))
         .route("/sessions/{session_id}", get(handle_get_session))
         .route("/sessions/{session_id}/view", get(handle_get_session_view))
+        .route(
+            "/sessions/{session_id}/execution-graph",
+            get(handle_get_execution_graph),
+        )
         .route("/sessions/{session_id}/records", get(handle_list_records))
         // SSE streaming
         .route("/sessions/{session_id}/stream", get(handle_sse_stream))
@@ -1071,6 +1107,18 @@ async fn handle_get_session_view(
     Ok(Json(build_session_view(snapshot)))
 }
 
+async fn handle_get_execution_graph(
+    State(state): State<RuntimeState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<ExecutionGraphView>, (StatusCode, String)> {
+    let snapshot = state
+        .memory
+        .load_session(&session_id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+    Ok(Json(build_execution_graph_view(&snapshot)))
+}
+
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RecordListParams {
@@ -1112,6 +1160,7 @@ fn build_session_view(snapshot: SessionSnapshot) -> SessionView {
     let status = derive_session_status(&snapshot, pending_approval.as_ref());
     let total_estimated_cost_usd = snapshot.total_estimated_cost_usd();
     let self_improvement = build_self_improvement_view(&snapshot);
+    let execution_graph = build_execution_graph_view(&snapshot);
 
     SessionView {
         session_id: snapshot.session_id,
@@ -1123,8 +1172,53 @@ fn build_session_view(snapshot: SessionSnapshot) -> SessionView {
         timeline,
         tool_timeline,
         self_improvement,
+        execution_graph,
         record_count: snapshot.records.len(),
         total_estimated_cost_usd,
+    }
+}
+
+fn build_execution_graph_view(snapshot: &SessionSnapshot) -> ExecutionGraphView {
+    let active_graph = snapshot.active_tool_execution_graph();
+    let graphs = snapshot.tool_execution_graphs();
+    let checkpoints = snapshot.tool_node_checkpoints();
+    let validations = snapshot.skill_input_validations();
+    let mut latest = BTreeMap::<String, rain_engine_core::ToolNodeStatus>::new();
+    for checkpoint in checkpoints.iter().filter(|checkpoint| {
+        active_graph
+            .as_ref()
+            .map(|graph| graph.graph_id == checkpoint.graph_id)
+            .unwrap_or(false)
+    }) {
+        latest.insert(checkpoint.call_id.clone(), checkpoint.status.clone());
+    }
+    let blocked_call_ids = active_graph
+        .as_ref()
+        .map(|graph| {
+            graph
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.dependencies.iter().any(|dependency| {
+                        matches!(
+                            latest.get(&dependency.call_id),
+                            Some(rain_engine_core::ToolNodeStatus::Failed)
+                                | Some(rain_engine_core::ToolNodeStatus::Skipped)
+                                | Some(rain_engine_core::ToolNodeStatus::TimedOut)
+                        )
+                    })
+                })
+                .map(|node| node.call_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    ExecutionGraphView {
+        active_graph,
+        graphs,
+        checkpoints,
+        validations,
+        blocked_call_ids,
     }
 }
 
@@ -1319,6 +1413,29 @@ fn build_timeline(records: &[SessionRecord]) -> Vec<TimelineItem> {
                 decision: resolution.decision.clone(),
                 occurred_at_ms: unix_time_ms(resolution.resolved_at),
             }),
+            SessionRecord::Deliberation(deliberation) => Some(TimelineItem::Plan {
+                summary: deliberation.summary.clone(),
+                candidate_actions: deliberation.candidate_actions.clone(),
+                confidence: deliberation.confidence,
+                outcome: deliberation.outcome.clone(),
+                occurred_at_ms: unix_time_ms(deliberation.created_at),
+            }),
+            SessionRecord::ToolNodeCheckpoint(checkpoint) => Some(TimelineItem::ToolCheckpoint {
+                call_id: checkpoint.call_id.clone(),
+                skill_name: checkpoint.skill_name.clone(),
+                status: checkpoint.status.clone(),
+                attempt: checkpoint.attempt,
+                detail: checkpoint.detail.clone(),
+                occurred_at_ms: unix_time_ms(checkpoint.occurred_at),
+            }),
+            SessionRecord::SkillInputValidation(validation) if !validation.valid => {
+                Some(TimelineItem::ValidationFailure {
+                    call_id: validation.call_id.clone(),
+                    skill_name: validation.skill_name.clone(),
+                    errors: validation.errors.clone(),
+                    occurred_at_ms: unix_time_ms(validation.validated_at),
+                })
+            }
             SessionRecord::Reflection(reflection) => Some(TimelineItem::Learning {
                 label: "reflection".to_string(),
                 detail: reflection.summary.clone(),
@@ -1732,6 +1849,10 @@ mod tests {
                 call_id: "native-call".to_string(),
                 name: "dangerous_native".to_string(),
                 args: json!({"apply": true}),
+                priority: 0,
+                depends_on: Vec::new(),
+                retry_policy: Default::default(),
+                dry_run: false,
             }]),
             AgentAction::Respond {
                 content: "completed".to_string(),

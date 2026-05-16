@@ -114,6 +114,10 @@ pub fn derive_skill_manifest(input: TokenStream) -> TokenStream {
                         timeout_ms: #timeout_ms,
                         max_memory_bytes: #max_memory_bytes,
                         max_fuel: #max_fuel_tokens,
+                        priority_class: 0,
+                        max_retries: 0,
+                        retry_backoff_ms: 250,
+                        dry_run_supported: false,
                     },
                     approval_required: #approval_required,
                 }
