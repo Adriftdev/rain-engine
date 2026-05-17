@@ -193,15 +193,19 @@ function SessionWorkbench(props: {
     return el.scrollHeight - el.scrollTop - el.clientHeight < 100;
   };
 
-  const virtualizer = createVirtualizer({
-    get count() {
-      const v = view();
-      if (!v) return 0;
-      return v.timeline.length + (busy() ? 1 : 0);
-    },
-    getScrollElement: () => scrollContainer(),
-    estimateSize: () => 100, // Reasonable default for a timeline item
-    overscan: 10,
+  const virtualizer = createMemo(() => {
+    const el = scrollContainer();
+    if (!el) return null;
+    return createVirtualizer({
+      get count() {
+        const v = view();
+        if (!v) return 0;
+        return v.timeline.length + (busy() ? 1 : 0);
+      },
+      getScrollElement: () => el,
+      estimateSize: () => 100, // Reasonable default for a timeline item
+      overscan: 10,
+    });
   });
 
   const sendInput = async () => {
@@ -260,7 +264,7 @@ function SessionWorkbench(props: {
             {(sessionView) => {
               return (
                 <div class={css({ maxW: '760px', w: 'full', mx: 'auto', display: 'flex', flexDir: 'column', gap: '32px', pb: '64px' })}>
-                  <Show when={scrollContainer()} fallback={
+                  <Show when={virtualizer()} fallback={
                     // Fallback before virtualizer initializes/mounts
                     <>
                       <For each={sessionView().timeline}>
@@ -271,9 +275,9 @@ function SessionWorkbench(props: {
                       </Show>
                     </>
                   }>
-                    {(_) => (
-                      <div style={{ height: `${virtualizer.getTotalSize()}px`, width: '100%', position: 'relative' }}>
-                        <For each={virtualizer.getVirtualItems()}>
+                    {(virt) => (
+                      <div style={{ height: `${virt().getTotalSize()}px`, width: '100%', position: 'relative' }}>
+                        <For each={virt().getVirtualItems()}>
                           {(virtualItem) => {
                             const isBusyRow = virtualItem.index === sessionView().timeline.length;
                             return (
@@ -285,7 +289,7 @@ function SessionWorkbench(props: {
                                   width: '100%',
                                   transform: `translateY(${virtualItem.start}px)`,
                                 }}
-                                ref={(el) => virtualizer.measureElement(el)}
+                                ref={(el) => virt().measureElement(el)}
                                 data-index={virtualItem.index}
                               >
                                 <div class={css({ pb: '32px' })}>
