@@ -29,6 +29,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 typeshare.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+base64.workspace = true
 
 [dev-dependencies]
 rain-engine-macros = { path = "../rain-engine-macros" }

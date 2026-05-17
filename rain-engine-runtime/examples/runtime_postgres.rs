@@ -22,6 +22,7 @@ fn main() {
         store: StoreBootstrapConfig::Postgres {
             database_url: "postgres://postgres:postgres@localhost/rain_engine".to_string(),
         },
+        cache: None,
         blob: BlobBootstrapConfig::InMemory,
         provider: ProviderBootstrapConfig::OpenAiCompatible {
             base_url: "https://api.openai.com/v1".to_string(),

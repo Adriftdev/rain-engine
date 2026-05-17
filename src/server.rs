@@ -27,6 +27,7 @@ impl Default for ServerBuilder {
                     },
                 },
                 store: StoreBootstrapConfig::InMemory, // Portable by default
+                cache: None,
                 blob: BlobBackendConfig::InMemory,     // Portable by default
                 provider: ProviderBootstrapConfig::Mock {
                     response: "Mock Response".to_string(),

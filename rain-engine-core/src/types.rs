@@ -904,6 +904,7 @@ pub struct ProviderCacheRecord {
 pub enum SelfImprovementMode {
     Advisory,
     AutoWithGuardrails,
+    Shadow,
 }
 
 #[typeshare::typeshare]
@@ -911,6 +912,7 @@ pub enum SelfImprovementMode {
 pub struct SelfImprovementPolicy {
     pub enabled: bool,
     pub mode: SelfImprovementMode,
+    pub evaluator_model: Option<String>,
     pub reflection_interval_records: usize,
     pub min_observations_before_tuning: usize,
     pub max_policy_delta_percent: f64,
@@ -923,6 +925,7 @@ impl Default for SelfImprovementPolicy {
         Self {
             enabled: true,
             mode: SelfImprovementMode::AutoWithGuardrails,
+            evaluator_model: None,
             reflection_interval_records: 8,
             min_observations_before_tuning: 2,
             max_policy_delta_percent: 25.0,

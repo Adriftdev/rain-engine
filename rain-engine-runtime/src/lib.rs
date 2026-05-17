@@ -141,7 +141,9 @@ pub struct DelegationResultIngressRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstallSkillRequest {
     pub manifest: rain_engine_core::SkillManifest,
-    pub wasm_url: String,
+    pub wasm_url: Option<String>,
+    pub wasm_base64: Option<String>,
+    pub file_path: Option<String>,
 }
 
 pub struct SkillInstallerSkill {
@@ -193,13 +195,14 @@ impl NativeSkill for SkillInstallerSkill {
             .ok_or_else(|| {
                 SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing description")
             })?;
-        let wasm_url = invocation
-            .args
-            .get("wasm_url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing wasm_url")
-            })?;
+        let wasm_url = invocation.args.get("wasm_url").and_then(|v| v.as_str());
+        let wasm_base64 = invocation.args.get("wasm_base64").and_then(|v| v.as_str());
+        let file_path = invocation.args.get("file_path").and_then(|v| v.as_str());
+
+        if wasm_url.is_none() && wasm_base64.is_none() && file_path.is_none() {
+            return Err(SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing wasm_url, wasm_base64, or file_path"));
+        }
+
         let input_schema = invocation
             .args
             .get("input_schema")
@@ -225,25 +228,39 @@ impl NativeSkill for SkillInstallerSkill {
         };
 
         // Reuse the handler logic or just do it here
-        let client = reqwest::Client::new();
-        let wasm_bytes = client
-            .get(wasm_url)
-            .send()
-            .await
-            .map_err(|err| {
-                SkillExecutionError::new(
-                    SkillFailureKind::Internal,
-                    format!("Download failed: {}", err),
-                )
+        let wasm_bytes = if let Some(url) = wasm_url {
+            let client = reqwest::Client::new();
+            client
+                .get(url)
+                .send()
+                .await
+                .map_err(|err| {
+                    SkillExecutionError::new(
+                        SkillFailureKind::Internal,
+                        format!("Download failed: {}", err),
+                    )
+                })?
+                .bytes()
+                .await
+                .map_err(|err| {
+                    SkillExecutionError::new(
+                        SkillFailureKind::Internal,
+                        format!("Read failed: {}", err),
+                    )
+                })?
+                .to_vec()
+        } else if let Some(b64) = wasm_base64 {
+            use base64::{Engine as _, engine::general_purpose};
+            general_purpose::STANDARD.decode(b64).map_err(|err| {
+                SkillExecutionError::new(SkillFailureKind::InvalidArguments, format!("Base64 decode failed: {}", err))
             })?
-            .bytes()
-            .await
-            .map_err(|err| {
-                SkillExecutionError::new(
-                    SkillFailureKind::Internal,
-                    format!("Read failed: {}", err),
-                )
-            })?;
+        } else if let Some(path) = file_path {
+            tokio::fs::read(path).await.map_err(|err| {
+                SkillExecutionError::new(SkillFailureKind::InvalidArguments, format!("File read failed: {}", err))
+            })?
+        } else {
+            return Err(SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing wasm_url, wasm_base64, or file_path"));
+        };
 
         let config = rain_engine_wasm::WasmSkillConfig {
             manifest: manifest.clone(),
@@ -292,6 +309,12 @@ pub enum StoreBootstrapConfig {
     InMemory,
     Sqlite { database_url: String },
     Postgres { database_url: String },
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CacheBootstrapConfig {
+    pub valkey_url: Option<String>,
 }
 
 pub type BlobBootstrapConfig = BlobBackendConfig;
@@ -361,6 +384,8 @@ fn default_gemini_embedding_model() -> String {
 pub struct RuntimeBootstrapConfig {
     pub server: RuntimeServerConfig,
     pub store: StoreBootstrapConfig,
+    #[serde(default)]
+    pub cache: Option<CacheBootstrapConfig>,
     pub blob: BlobBootstrapConfig,
     pub provider: ProviderBootstrapConfig,
     #[serde(default)]
@@ -711,6 +736,16 @@ pub async fn build_runtime_state(
     };
 
     let mut engine = AgentEngine::new(llm.clone(), memory.clone());
+    
+    if let Some(cache_config) = &config.cache {
+        if let Some(valkey_url) = &cache_config.valkey_url {
+            let valkey_cache = rain_engine_core::ValkeyStateCache::new(valkey_url, "rain")
+                .map_err(|err| RuntimeConfigError::Invalid(format!("Valkey cache error: {}", err)))?;
+            engine = engine.with_state_cache(Arc::new(valkey_cache));
+            tracing::info!("Configured Valkey state projection cache");
+        }
+    }
+
     if let Some(store) = &skill_store {
         engine = engine.with_skill_store(store.clone());
 
@@ -1296,11 +1331,15 @@ async fn handle_get_session(
     State(state): State<RuntimeState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let snapshot = state
-        .memory
-        .load_session(&session_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+    let snapshot = if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
+        cached
+    } else {
+        state
+            .memory
+            .load_session(&session_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
+    };
     Ok(Json(serde_json::to_value(snapshot).unwrap_or_default()))
 }
 
@@ -1308,11 +1347,15 @@ async fn handle_get_session_view(
     State(state): State<RuntimeState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionView>, (StatusCode, String)> {
-    let snapshot = state
-        .memory
-        .load_session(&session_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+    let snapshot = if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
+        cached
+    } else {
+        state
+            .memory
+            .load_session(&session_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
+    };
     Ok(Json(build_session_view(snapshot)))
 }
 
@@ -1320,11 +1363,15 @@ async fn handle_get_execution_graph(
     State(state): State<RuntimeState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ExecutionGraphView>, (StatusCode, String)> {
-    let snapshot = state
-        .memory
-        .load_session(&session_id)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+    let snapshot = if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
+        cached
+    } else {
+        state
+            .memory
+            .load_session(&session_id)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
+    };
     Ok(Json(build_execution_graph_view(&snapshot)))
 }
 
@@ -1345,24 +1392,35 @@ async fn handle_install_skill(
     State(state): State<RuntimeState>,
     Json(request): Json<InstallSkillRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    info!(
-        "Attempting to install skill: {} from {}",
-        request.manifest.name, request.wasm_url
-    );
+    info!("Attempting to install skill: {}", request.manifest.name);
 
-    let client = reqwest::Client::new();
-    let wasm_bytes = client
-        .get(&request.wasm_url)
-        .send()
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("Download failed: {}", err)))?
-        .bytes()
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("Read failed: {}", err)))?;
+    let wasm_bytes = if let Some(url) = &request.wasm_url {
+        let client = reqwest::Client::new();
+        client
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| (StatusCode::BAD_GATEWAY, format!("Download failed: {}", err)))?
+            .bytes()
+            .await
+            .map_err(|err| (StatusCode::BAD_GATEWAY, format!("Read failed: {}", err)))?
+            .to_vec()
+    } else if let Some(b64) = &request.wasm_base64 {
+        use base64::{Engine as _, engine::general_purpose};
+        general_purpose::STANDARD.decode(b64).map_err(|err| {
+            (StatusCode::BAD_REQUEST, format!("Base64 decode failed: {}", err))
+        })?
+    } else if let Some(path) = &request.file_path {
+        tokio::fs::read(path).await.map_err(|err| {
+            (StatusCode::BAD_REQUEST, format!("File read failed: {}", err))
+        })?
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Must provide wasm_url, wasm_base64, or file_path".to_string()));
+    };
 
     let config = rain_engine_wasm::WasmSkillConfig {
         manifest: request.manifest.clone(),
-        wasm_bytes: Arc::new(wasm_bytes.to_vec()),
+        wasm_bytes: Arc::new(wasm_bytes.clone()),
         capabilities: Arc::new(rain_engine_wasm::InMemoryCapabilityHost::new().with_http_client()),
     };
 
@@ -1375,7 +1433,7 @@ async fn handle_install_skill(
     let executor = Arc::new(executor);
     state
         .engine
-        .register_wasm_skill_persistent(request.manifest, executor.clone(), wasm_bytes.to_vec())
+        .register_wasm_skill_persistent(request.manifest, executor.clone(), wasm_bytes)
         .await
         .map_err(|err| {
             (
@@ -2216,6 +2274,7 @@ mod tests {
             store: StoreBootstrapConfig::Sqlite {
                 database_url: "".to_string(),
             },
+            cache: None,
             blob: BlobBootstrapConfig::InMemory,
             provider: ProviderBootstrapConfig::Mock {
                 response: "processed".to_string(),

@@ -35,3 +35,10 @@ pub trait SkillStore: Send + Sync {
     async fn list_skills(&self) -> Result<Vec<(crate::SkillManifest, Vec<u8>)>, String>;
     async fn remove_skill(&self, name: &str) -> Result<(), String>;
 }
+
+#[async_trait]
+pub trait StateProjectionCache: Send + Sync {
+    async fn get_projection(&self, session_id: &str) -> Result<Option<crate::SessionSnapshot>, String>;
+    async fn set_projection(&self, session_id: &str, snapshot: crate::SessionSnapshot) -> Result<(), String>;
+    async fn invalidate(&self, session_id: &str) -> Result<(), String>;
+}

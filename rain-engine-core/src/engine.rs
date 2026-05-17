@@ -165,6 +165,7 @@ impl RegisteredSkill {
 pub struct AgentEngine {
     llm: Arc<dyn LlmProvider>,
     memory: Arc<dyn MemoryStore>,
+    state_cache: Arc<dyn crate::StateProjectionCache>,
     skill_store: Option<Arc<dyn SkillStore>>,
     skills: Arc<DashMap<String, RegisteredSkill>>,
     planner: Option<Arc<dyn Planner>>,
@@ -175,10 +176,20 @@ impl AgentEngine {
         Self {
             llm,
             memory,
+            state_cache: Arc::new(crate::InMemoryStateCache::new()),
             skill_store: None,
             skills: Arc::new(DashMap::new()),
             planner: None,
         }
+    }
+
+    pub fn state_cache(&self) -> Arc<dyn crate::StateProjectionCache> {
+        self.state_cache.clone()
+    }
+
+    pub fn with_state_cache(mut self, state_cache: Arc<dyn crate::StateProjectionCache>) -> Self {
+        self.state_cache = state_cache;
+        self
     }
 
     pub fn with_skill_store(mut self, skill_store: Arc<dyn SkillStore>) -> Self {
@@ -269,7 +280,7 @@ impl AgentEngine {
             trigger: request.trigger.clone(),
             intent: None,
         };
-        if let Err(err) = self.memory.append_trigger(trigger_record).await {
+        if let Err(err) = self.memory.append_trigger(trigger_record.clone()).await {
             return Ok(AdvanceResult {
                 outcome: Some(storage_failure_outcome(trigger_id, 0, err.message)),
                 emitted_events: Vec::new(),
@@ -278,15 +289,21 @@ impl AgentEngine {
             });
         }
 
-        let mut snapshot = match self.memory.load_session(&request.session_id).await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                return Ok(AdvanceResult {
-                    outcome: Some(storage_failure_outcome(trigger_id, 0, err.message)),
-                    emitted_events: Vec::new(),
-                    state_delta: AgentStateDelta::default(),
-                    wake_request: None,
-                });
+        let mut snapshot = match self.state_cache.get_projection(&request.session_id).await {
+            Ok(Some(mut cached)) => {
+                cached.records.push(SessionRecord::Trigger(trigger_record));
+                cached
+            }
+            _ => match self.memory.load_session(&request.session_id).await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    return Ok(AdvanceResult {
+                        outcome: Some(storage_failure_outcome(trigger_id, 0, err.message)),
+                        emitted_events: Vec::new(),
+                        state_delta: AgentStateDelta::default(),
+                        wake_request: None,
+                    });
+                }
             }
         };
         counter!("rain_engine.triggers_total").increment(1);
@@ -681,7 +698,7 @@ impl AgentEngine {
             return Ok(build_advance_result(outcome, emitted_events));
         }
 
-        let available_skills = self
+        let mut available_skills = self
             .skills
             .iter()
             .filter(|skill| {
@@ -695,13 +712,38 @@ impl AgentEngine {
             .map(|skill| skill.value().definition())
             .collect::<Vec<_>>();
 
+        // Enforce Strategy Preferences: If a tool has a high failure rate, append a warning
+        // to its description so the LLM avoids using it.
+        let preferences: HashMap<_, _> = context
+            .records
+            .iter()
+            .filter_map(|record| {
+                if let SessionRecord::StrategyPreference(pref) = record {
+                    if let Some(skill_name) = &pref.skill_name {
+                        return Some((skill_name.clone(), pref.reason.clone()));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        for def in &mut available_skills {
+            if let Some(reason) = preferences.get(&def.manifest.name) {
+                def.manifest.description = format!(
+                    "{} [CRITICAL WARNING: Avoid using this tool if possible. Reason: {}]",
+                    def.manifest.description, reason
+                );
+            }
+        }
+
+        let plan = context.active_execution_plan();
         let provider_request = ProviderRequest {
             trigger: trigger.clone(),
             context: context.to_snapshot(steps_executed),
             available_skills,
             config: context.metadata.provider.clone(),
             policy: context.metadata.policy.clone(),
-            contents: build_provider_contents(&trigger, &context.records),
+            contents: build_provider_contents(&trigger, &context.records, plan.as_ref()),
         };
         let provider_started = Instant::now();
         let decision = match tokio::time::timeout(
@@ -1618,21 +1660,26 @@ impl AgentEngine {
             .append_outcome(&context.session_id, outcome.clone())
             .await
         {
-            error!("failed to persist outcome: {}", err.message);
-            return Ok(storage_failure_outcome(
-                context.metadata.trigger_id.clone(),
-                steps_executed,
-                err.message,
-            ));
+            warn!(session_id = %context.session_id, "failed to record outcome: {}", err.message);
         }
-        context
-            .records
-            .push(SessionRecord::Outcome(outcome.clone()));
-        let session_id = context.session_id.clone();
-        let snapshot = context.to_snapshot(steps_executed);
+
+        context.records.push(SessionRecord::Outcome(outcome.clone()));
+
         let outcome_clone = outcome.clone();
-        self.run_self_improvement(session_id, snapshot, outcome_clone)
+        self.run_self_improvement(context, outcome_clone)
             .await?;
+
+        // Update the state projection cache AFTER self improvement
+        let _ = self.state_cache.set_projection(
+            &context.session_id,
+            SessionSnapshot {
+                session_id: context.session_id.clone(),
+                records: context.records.clone(),
+                last_sequence_no: None,
+                latest_outcome: Some(outcome.clone()),
+            }
+        ).await;
+
         Ok(EngineOutcome {
             trigger_id: outcome.trigger_id,
             stop_reason,
@@ -1645,19 +1692,20 @@ impl AgentEngine {
     }
 
     #[instrument(
-        skip(self, snapshot, outcome),
+        skip(self, context, outcome),
         fields(
-            session_id = %session_id,
-            trigger_id = %snapshot.trigger_id,
+            session_id = %context.session_id,
+            trigger_id = %context.metadata.trigger_id,
             stop_reason = ?outcome.stop_reason
         )
     )]
     async fn run_self_improvement(
         &self,
-        session_id: String,
-        snapshot: AgentContextSnapshot,
+        context: &mut AgentContext,
         outcome: OutcomeRecord,
     ) -> Result<(), EngineError> {
+        let snapshot = context.to_snapshot(outcome.steps_executed);
+        let session_id = context.session_id.clone();
         let policy = snapshot.policy.self_improvement.clone();
         if !policy.enabled {
             return Ok(());
@@ -1680,11 +1728,14 @@ impl AgentEngine {
         self.memory
             .append_reflection(&session_id, reflection.clone())
             .await?;
+        context.records.push(SessionRecord::Reflection(reflection));
 
         for performance in summarize_tool_performance(&snapshot.history) {
             self.memory
                 .append_tool_performance(&session_id, performance.clone())
                 .await?;
+            context.records.push(SessionRecord::ToolPerformance(performance.clone()));
+
             if performance.calls > 0 {
                 counter!(
                     "rain_engine.tool_performance_summaries_total",
@@ -1706,8 +1757,9 @@ impl AgentEngine {
                     confidence: 0.68,
                 };
                 self.memory
-                    .append_strategy_preference(&session_id, preference)
+                    .append_strategy_preference(&session_id, preference.clone())
                     .await?;
+                context.records.push(SessionRecord::StrategyPreference(preference));
             }
         }
 
@@ -1717,8 +1769,9 @@ impl AgentEngine {
 
         if let Some(rollback) = maybe_rollback_regression(&snapshot, &outcome) {
             self.memory
-                .append_policy_tuning(&session_id, rollback)
+                .append_policy_tuning(&session_id, rollback.clone())
                 .await?;
+            context.records.push(SessionRecord::PolicyTuning(rollback));
             counter!("rain_engine.self_improvement_rollbacks_total").increment(1);
             return Ok(());
         }
@@ -1736,8 +1789,9 @@ impl AgentEngine {
             PolicyTuningAction::Proposed | PolicyTuningAction::RolledBack => {}
         }
         self.memory
-            .append_policy_tuning(&session_id, tuning)
+            .append_policy_tuning(&session_id, tuning.clone())
             .await?;
+        context.records.push(SessionRecord::PolicyTuning(tuning));
 
         let profile_patch = ProfilePatchRecord {
             patch_id: format!("profile-patch-{}", Uuid::new_v4()),
@@ -1748,8 +1802,9 @@ impl AgentEngine {
             applied: true,
         };
         self.memory
-            .append_profile_patch(&session_id, profile_patch)
+            .append_profile_patch(&session_id, profile_patch.clone())
             .await?;
+        context.records.push(SessionRecord::ProfilePatch(profile_patch));
 
         Ok(())
     }
@@ -1986,12 +2041,13 @@ fn maybe_rollback_regression(
     if !snapshot.policy.self_improvement.rollback_on_regression {
         return None;
     }
+    // MaxStepsReached is not a regression. Hitting the step limit at a higher budget
+    // is progress, not a failure of the policy overlay itself.
     if !matches!(
         outcome.stop_reason,
         StopReason::ProviderFailure
             | StopReason::DeadlineExceeded
             | StopReason::PolicyAborted
-            | StopReason::MaxStepsReached
     ) {
         return None;
     }
@@ -2048,7 +2104,11 @@ fn propose_policy_tuning(
             );
         }
         StopReason::MaxStepsReached => {
-            patch.max_steps = Some(increase_usize_by_percent(snapshot.policy.max_steps, delta));
+            // Scale up aggressively if we keep hitting the step limit (delta, then 2x delta, etc.)
+            // We use the terminal observation count as a multiplier
+            let multiplier = terminal_observation_count(&snapshot.history).max(1) as f64;
+            let aggressive_delta = (delta * multiplier).min(200.0); // Cap at 200% increase per try
+            patch.max_steps = Some(increase_usize_by_percent(snapshot.policy.max_steps, aggressive_delta));
             reason = Some(
                 "Session hit max steps; increasing future step budget within guardrails."
                     .to_string(),
@@ -2082,6 +2142,7 @@ fn propose_policy_tuning(
         status: match improvement.mode {
             SelfImprovementMode::Advisory => PolicyOverlayStatus::Proposed,
             SelfImprovementMode::AutoWithGuardrails => PolicyOverlayStatus::Applied,
+            SelfImprovementMode::Shadow => PolicyOverlayStatus::Proposed, // Will be elevated to Applied by the shadow task
         },
         reason,
         evidence_window_records: snapshot.history.len(),
@@ -2103,6 +2164,10 @@ fn propose_policy_tuning(
     } else {
         match improvement.mode {
             SelfImprovementMode::Advisory => PolicyTuningAction::Proposed,
+            SelfImprovementMode::Shadow => {
+                overlay.status = PolicyOverlayStatus::Proposed; // Start as proposed in shadow mode
+                PolicyTuningAction::Proposed
+            },
             SelfImprovementMode::AutoWithGuardrails => PolicyTuningAction::Applied,
         }
     };
@@ -2627,6 +2692,7 @@ fn derive_trigger_kernel_events(
 fn build_provider_contents(
     trigger: &AgentTrigger,
     history: &[SessionRecord],
+    active_plan: Option<&ExecutionPlanRecord>,
 ) -> Vec<ProviderMessage> {
     let mut messages = Vec::new();
     let mut intent_by_trigger = HashMap::<String, String>::new();
@@ -2705,6 +2771,19 @@ fn build_provider_contents(
         role: ProviderRole::User,
         parts: build_trigger_parts(trigger),
     });
+
+    // Inject Chain of Thought active plan if one exists
+    if let Some(plan) = active_plan {
+        messages.push(ProviderMessage {
+            role: ProviderRole::System,
+            parts: vec![ProviderContentPart::Text(format!(
+                "You are currently executing an active, multi-step plan.\n\nOBJECTIVE: {}\n\nYou are on step {} of {}.\n\nPlease stay focused on the objective and execute the necessary actions for this specific step.",
+                plan.objective,
+                plan.current_step_index + 1,
+                plan.steps.len()
+            ))],
+        });
+    }
 
     messages
 }

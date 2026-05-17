@@ -15,6 +15,7 @@ mod models;
 mod policy;
 mod retrieval;
 mod skill_store;
+mod state_cache;
 mod traits;
 mod types;
 
@@ -31,6 +32,7 @@ pub use models::*;
 pub use policy::*;
 pub use retrieval::*;
 pub use skill_store::*;
+pub use state_cache::*;
 #[allow(unused_imports)]
 pub use traits::*;
 #[allow(unused_imports)]

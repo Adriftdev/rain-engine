@@ -28,6 +28,7 @@ fn main() {
         store: StoreBootstrapConfig::Postgres {
             database_url: "postgres://postgres:postgres@localhost/rain_engine".to_string(),
         },
+        cache: None,
         blob: BlobBootstrapConfig::LocalDirectory {
             path: "./.rain-engine/blobs".to_string(),
         },

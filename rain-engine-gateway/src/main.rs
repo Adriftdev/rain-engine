@@ -452,6 +452,7 @@ fn resolve_config() -> Result<RuntimeBootstrapConfig, Box<dyn std::error::Error>
             default_provider: ProviderRequestConfig::default(),
         },
         store,
+        cache: None, // No valkey cache configured via ENV yet
         blob,
         provider,
         enable_research_planner: env::var("RAIN_ENABLE_RESEARCH_PLANNER")
