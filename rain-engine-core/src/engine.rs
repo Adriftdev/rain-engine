@@ -304,7 +304,7 @@ impl AgentEngine {
                         wake_request: None,
                     });
                 }
-            }
+            },
         };
         counter!("rain_engine.triggers_total").increment(1);
 
@@ -1663,22 +1663,26 @@ impl AgentEngine {
             warn!(session_id = %context.session_id, "failed to record outcome: {}", err.message);
         }
 
-        context.records.push(SessionRecord::Outcome(outcome.clone()));
+        context
+            .records
+            .push(SessionRecord::Outcome(outcome.clone()));
 
         let outcome_clone = outcome.clone();
-        self.run_self_improvement(context, outcome_clone)
-            .await?;
+        self.run_self_improvement(context, outcome_clone).await?;
 
         // Update the state projection cache AFTER self improvement
-        let _ = self.state_cache.set_projection(
-            &context.session_id,
-            SessionSnapshot {
-                session_id: context.session_id.clone(),
-                records: context.records.clone(),
-                last_sequence_no: None,
-                latest_outcome: Some(outcome.clone()),
-            }
-        ).await;
+        let _ = self
+            .state_cache
+            .set_projection(
+                &context.session_id,
+                SessionSnapshot {
+                    session_id: context.session_id.clone(),
+                    records: context.records.clone(),
+                    last_sequence_no: None,
+                    latest_outcome: Some(outcome.clone()),
+                },
+            )
+            .await;
 
         Ok(EngineOutcome {
             trigger_id: outcome.trigger_id,
@@ -1734,7 +1738,9 @@ impl AgentEngine {
             self.memory
                 .append_tool_performance(&session_id, performance.clone())
                 .await?;
-            context.records.push(SessionRecord::ToolPerformance(performance.clone()));
+            context
+                .records
+                .push(SessionRecord::ToolPerformance(performance.clone()));
 
             if performance.calls > 0 {
                 counter!(
@@ -1759,7 +1765,9 @@ impl AgentEngine {
                 self.memory
                     .append_strategy_preference(&session_id, preference.clone())
                     .await?;
-                context.records.push(SessionRecord::StrategyPreference(preference));
+                context
+                    .records
+                    .push(SessionRecord::StrategyPreference(preference));
             }
         }
 
@@ -1804,7 +1812,9 @@ impl AgentEngine {
         self.memory
             .append_profile_patch(&session_id, profile_patch.clone())
             .await?;
-        context.records.push(SessionRecord::ProfilePatch(profile_patch));
+        context
+            .records
+            .push(SessionRecord::ProfilePatch(profile_patch));
 
         Ok(())
     }
@@ -2045,9 +2055,7 @@ fn maybe_rollback_regression(
     // is progress, not a failure of the policy overlay itself.
     if !matches!(
         outcome.stop_reason,
-        StopReason::ProviderFailure
-            | StopReason::DeadlineExceeded
-            | StopReason::PolicyAborted
+        StopReason::ProviderFailure | StopReason::DeadlineExceeded | StopReason::PolicyAborted
     ) {
         return None;
     }
@@ -2108,7 +2116,10 @@ fn propose_policy_tuning(
             // We use the terminal observation count as a multiplier
             let multiplier = terminal_observation_count(&snapshot.history).max(1) as f64;
             let aggressive_delta = (delta * multiplier).min(200.0); // Cap at 200% increase per try
-            patch.max_steps = Some(increase_usize_by_percent(snapshot.policy.max_steps, aggressive_delta));
+            patch.max_steps = Some(increase_usize_by_percent(
+                snapshot.policy.max_steps,
+                aggressive_delta,
+            ));
             reason = Some(
                 "Session hit max steps; increasing future step budget within guardrails."
                     .to_string(),
@@ -2167,7 +2178,7 @@ fn propose_policy_tuning(
             SelfImprovementMode::Shadow => {
                 overlay.status = PolicyOverlayStatus::Proposed; // Start as proposed in shadow mode
                 PolicyTuningAction::Proposed
-            },
+            }
             SelfImprovementMode::AutoWithGuardrails => PolicyTuningAction::Applied,
         }
     };

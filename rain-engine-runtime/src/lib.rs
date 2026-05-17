@@ -200,7 +200,10 @@ impl NativeSkill for SkillInstallerSkill {
         let file_path = invocation.args.get("file_path").and_then(|v| v.as_str());
 
         if wasm_url.is_none() && wasm_base64.is_none() && file_path.is_none() {
-            return Err(SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing wasm_url, wasm_base64, or file_path"));
+            return Err(SkillExecutionError::new(
+                SkillFailureKind::InvalidArguments,
+                "missing wasm_url, wasm_base64, or file_path",
+            ));
         }
 
         let input_schema = invocation
@@ -252,14 +255,23 @@ impl NativeSkill for SkillInstallerSkill {
         } else if let Some(b64) = wasm_base64 {
             use base64::{Engine as _, engine::general_purpose};
             general_purpose::STANDARD.decode(b64).map_err(|err| {
-                SkillExecutionError::new(SkillFailureKind::InvalidArguments, format!("Base64 decode failed: {}", err))
+                SkillExecutionError::new(
+                    SkillFailureKind::InvalidArguments,
+                    format!("Base64 decode failed: {}", err),
+                )
             })?
         } else if let Some(path) = file_path {
             tokio::fs::read(path).await.map_err(|err| {
-                SkillExecutionError::new(SkillFailureKind::InvalidArguments, format!("File read failed: {}", err))
+                SkillExecutionError::new(
+                    SkillFailureKind::InvalidArguments,
+                    format!("File read failed: {}", err),
+                )
             })?
         } else {
-            return Err(SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing wasm_url, wasm_base64, or file_path"));
+            return Err(SkillExecutionError::new(
+                SkillFailureKind::InvalidArguments,
+                "missing wasm_url, wasm_base64, or file_path",
+            ));
         };
 
         let config = rain_engine_wasm::WasmSkillConfig {
@@ -736,11 +748,13 @@ pub async fn build_runtime_state(
     };
 
     let mut engine = AgentEngine::new(llm.clone(), memory.clone());
-    
+
     if let Some(cache_config) = &config.cache {
         if let Some(valkey_url) = &cache_config.valkey_url {
             let valkey_cache = rain_engine_core::ValkeyStateCache::new(valkey_url, "rain")
-                .map_err(|err| RuntimeConfigError::Invalid(format!("Valkey cache error: {}", err)))?;
+                .map_err(|err| {
+                    RuntimeConfigError::Invalid(format!("Valkey cache error: {}", err))
+                })?;
             engine = engine.with_state_cache(Arc::new(valkey_cache));
             tracing::info!("Configured Valkey state projection cache");
         }
@@ -1331,15 +1345,16 @@ async fn handle_get_session(
     State(state): State<RuntimeState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let snapshot = if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
-        cached
-    } else {
-        state
-            .memory
-            .load_session(&session_id)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
-    };
+    let snapshot =
+        if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
+            cached
+        } else {
+            state
+                .memory
+                .load_session(&session_id)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
+        };
     Ok(Json(serde_json::to_value(snapshot).unwrap_or_default()))
 }
 
@@ -1347,15 +1362,16 @@ async fn handle_get_session_view(
     State(state): State<RuntimeState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionView>, (StatusCode, String)> {
-    let snapshot = if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
-        cached
-    } else {
-        state
-            .memory
-            .load_session(&session_id)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
-    };
+    let snapshot =
+        if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
+            cached
+        } else {
+            state
+                .memory
+                .load_session(&session_id)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
+        };
     Ok(Json(build_session_view(snapshot)))
 }
 
@@ -1363,15 +1379,16 @@ async fn handle_get_execution_graph(
     State(state): State<RuntimeState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ExecutionGraphView>, (StatusCode, String)> {
-    let snapshot = if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
-        cached
-    } else {
-        state
-            .memory
-            .load_session(&session_id)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
-    };
+    let snapshot =
+        if let Ok(Some(cached)) = state.engine.state_cache().get_projection(&session_id).await {
+            cached
+        } else {
+            state
+                .memory
+                .load_session(&session_id)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
+        };
     Ok(Json(build_execution_graph_view(&snapshot)))
 }
 
@@ -1408,14 +1425,23 @@ async fn handle_install_skill(
     } else if let Some(b64) = &request.wasm_base64 {
         use base64::{Engine as _, engine::general_purpose};
         general_purpose::STANDARD.decode(b64).map_err(|err| {
-            (StatusCode::BAD_REQUEST, format!("Base64 decode failed: {}", err))
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Base64 decode failed: {}", err),
+            )
         })?
     } else if let Some(path) = &request.file_path {
         tokio::fs::read(path).await.map_err(|err| {
-            (StatusCode::BAD_REQUEST, format!("File read failed: {}", err))
+            (
+                StatusCode::BAD_REQUEST,
+                format!("File read failed: {}", err),
+            )
         })?
     } else {
-        return Err((StatusCode::BAD_REQUEST, "Must provide wasm_url, wasm_base64, or file_path".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Must provide wasm_url, wasm_base64, or file_path".to_string(),
+        ));
     };
 
     let config = rain_engine_wasm::WasmSkillConfig {

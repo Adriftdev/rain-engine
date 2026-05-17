@@ -71,8 +71,8 @@ impl StateProjectionCache for ValkeyStateCache {
 
         match val {
             Some(bytes) => {
-                let snapshot =
-                    serde_json::from_slice(&bytes).map_err(|e| format!("De-serialize error: {}", e))?;
+                let snapshot = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("De-serialize error: {}", e))?;
                 Ok(Some(snapshot))
             }
             None => Ok(None),

@@ -38,7 +38,14 @@ pub trait SkillStore: Send + Sync {
 
 #[async_trait]
 pub trait StateProjectionCache: Send + Sync {
-    async fn get_projection(&self, session_id: &str) -> Result<Option<crate::SessionSnapshot>, String>;
-    async fn set_projection(&self, session_id: &str, snapshot: crate::SessionSnapshot) -> Result<(), String>;
+    async fn get_projection(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::SessionSnapshot>, String>;
+    async fn set_projection(
+        &self,
+        session_id: &str,
+        snapshot: crate::SessionSnapshot,
+    ) -> Result<(), String>;
     async fn invalidate(&self, session_id: &str) -> Result<(), String>;
 }

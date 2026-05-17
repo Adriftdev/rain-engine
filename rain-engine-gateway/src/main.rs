@@ -146,17 +146,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------------------------------------------------------------------
     // Build the HTTP router with CORS
     // ---------------------------------------------------------------------------
-    let cors_base = CorsLayer::new()
-        .allow_methods(Any)
-        .allow_headers(Any);
-        
+    let cors_base = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+
     let cors = if let Ok(origins) = env::var("RAIN_CORS_ALLOWED_ORIGINS") {
         if origins == "*" {
             cors_base.allow_origin(Any)
         } else {
-            // To simplify for the gateway, if a specific list is provided, 
-            // we'll just use the first one exactly, or require a more complex CORS layer 
-            // for multiple. For now, since tower-http's AllowOrigin::list takes an array 
+            // To simplify for the gateway, if a specific list is provided,
+            // we'll just use the first one exactly, or require a more complex CORS layer
+            // for multiple. For now, since tower-http's AllowOrigin::list takes an array
             // and is hard to build dynamically, we'll allow Any if they set origins dynamically
             // but log a warning. A proper production setup would use a custom origin closure.
             // Let's implement it the simplest secure way: if it's set to a specific single domain, use that.
