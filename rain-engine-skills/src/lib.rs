@@ -26,7 +26,7 @@ fn base_manifest(name: &str, description: &str, input_schema: serde_json::Value)
             max_fuel: None,
             priority_class: 0,
             retry_policy: RetryPolicy {
-                max_attempts: 0,
+                max_attempts: 3,
                 initial_interval_ms: 250,
                 backoff_multiplier: 2.0,
                 max_interval_ms: 10_000,

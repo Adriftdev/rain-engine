@@ -1,7 +1,9 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
 import { css, cx } from 'styled-system/css';
 import { flex } from 'styled-system/patterns';
-import { SolidMarkdown } from 'solid-markdown';
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
+import { createVirtualizer } from '@tanstack/solid-virtual';
 import {
   ApprovalDecision,
   RainEngineClient,
@@ -160,6 +162,8 @@ function SessionWorkbench(props: {
   const [approvalReason, setApprovalReason] = createSignal('');
   const [activeTab, setActiveTab] = createSignal<'timeline' | 'state' | 'tools' | 'graph' | 'learning' | 'raw'>('timeline');
 
+  const [scrollContainer, setScrollContainer] = createSignal<HTMLDivElement | null>(null);
+
   createEffect(() => {
     const sessionId = props.sessionId;
     setView(null);
@@ -168,9 +172,12 @@ function SessionWorkbench(props: {
 
     const source = client.streamSessionEvents(sessionId, {
       onView: (nextView) => {
+        const wasAtBottom = isAtBottom();
         setView(nextView);
         props.onActivity();
-        queueMicrotask(scrollTranscriptToBottom);
+        if (wasAtBottom) {
+          queueMicrotask(scrollTranscriptToBottom);
+        }
       },
       onError: () => setError('Link severed. Attempting to re-establish connection...'),
     });
@@ -179,6 +186,23 @@ function SessionWorkbench(props: {
   });
 
   const pendingApproval = createMemo(() => view()?.pending_approval ?? null);
+  
+  const isAtBottom = () => {
+    const el = scrollContainer();
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+  };
+
+  const virtualizer = createVirtualizer({
+    get count() {
+      const v = view();
+      if (!v) return 0;
+      return v.timeline.length + (busy() ? 1 : 0);
+    },
+    getScrollElement: () => scrollContainer(),
+    estimateSize: () => 100, // Reasonable default for a timeline item
+    overscan: 10,
+  });
 
   const sendInput = async () => {
     const content = draft().trim();
@@ -231,18 +255,52 @@ function SessionWorkbench(props: {
       <section class={transcriptPaneClass}>
         <SessionHeader sessionId={props.sessionId} view={view()} capabilities={props.capabilities} />
 
-        <div id="transcript-scroll" class={transcriptScrollClass}>
+        <div id="transcript-scroll" class={transcriptScrollClass} ref={setScrollContainer}>
           <Show when={view()} fallback={<PanelNote>Waiting for session synchronization…</PanelNote>}>
-            {(sessionView) => (
-              <div class={css({ maxW: '760px', w: 'full', mx: 'auto', display: 'flex', flexDir: 'column', gap: '32px', pb: '64px' })}>
-                <For each={sessionView().timeline}>
-                  {(item) => <TimelineRow item={item} />}
-                </For>
-                <Show when={busy()}>
-                  <ThinkingRow />
-                </Show>
-              </div>
-            )}
+            {(sessionView) => {
+              return (
+                <div class={css({ maxW: '760px', w: 'full', mx: 'auto', display: 'flex', flexDir: 'column', gap: '32px', pb: '64px' })}>
+                  <Show when={scrollContainer()} fallback={
+                    // Fallback before virtualizer initializes/mounts
+                    <>
+                      <For each={sessionView().timeline}>
+                        {(item) => <TimelineRow item={item} />}
+                      </For>
+                      <Show when={busy()}>
+                        <ThinkingRow />
+                      </Show>
+                    </>
+                  }>
+                    {(_) => (
+                      <div style={{ height: `${virtualizer.getTotalSize()}px`, width: '100%', position: 'relative' }}>
+                        <For each={virtualizer.getVirtualItems()}>
+                          {(virtualItem) => {
+                            const isBusyRow = virtualItem.index === sessionView().timeline.length;
+                            return (
+                              <div
+                                style={{
+                                  position: 'absolute',
+                                  top: 0,
+                                  left: 0,
+                                  width: '100%',
+                                  transform: `translateY(${virtualItem.start}px)`,
+                                }}
+                                ref={(el) => virtualizer.measureElement(el)}
+                                data-index={virtualItem.index}
+                              >
+                                <div class={css({ pb: '32px' })}>
+                                  {isBusyRow ? <ThinkingRow /> : <TimelineRow item={sessionView().timeline[virtualItem.index]} />}
+                                </div>
+                              </div>
+                            );
+                          }}
+                        </For>
+                      </div>
+                    )}
+                  </Show>
+                </div>
+              );
+            }}
           </Show>
         </div>
 
@@ -330,13 +388,33 @@ function TimelineRow(props: { item: TimelineItem }) {
   }
 
   if (props.item.type === 'AssistantResponse') {
+    const rawHtml = () => {
+      try {
+        const parsed = marked.parse(payload().content, { async: false });
+        return DOMPurify.sanitize(parsed as string);
+      } catch (e) {
+        return payload().content;
+      }
+    };
+    
     return (
       <div class={flex({ justify: 'flex-start', animation: 'fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1)' })}>
         <article class={assistantBubbleClass}>
           <div class={bubbleMetaClass}>Agent · {payload().stop_reason}</div>
-          <div class={css({ fontSize: '15px', lineHeight: '1.6' })}>
-            <SolidMarkdown children={payload().content} />
-          </div>
+          <div 
+            class={css({ 
+              fontSize: '15px', 
+              lineHeight: '1.6',
+              '& p': { mb: '12px' },
+              '& p:last-child': { mb: 0 },
+              '& ul, & ol': { pl: '20px', mb: '12px' },
+              '& li': { mb: '4px' },
+              '& code': { fontFamily: 'var(--font-mono)', fontSize: '13px', bg: 'white/10', px: '4px', py: '2px', borderRadius: '4px' },
+              '& pre': { bg: 'white/5', p: '12px', borderRadius: '8px', overflowX: 'auto', mb: '12px' },
+              '& pre code': { bg: 'transparent', px: 0, py: 0 }
+            })}
+            innerHTML={rawHtml()} 
+          />
         </article>
       </div>
     );
@@ -622,30 +700,138 @@ function ExecutionGraphPanel(props: { view: SessionView }) {
       </div>
 
       <Show when={graph().active_graph} fallback={<PanelNote>No active execution graph.</PanelNote>}>
-        {(active) => (
-          <div class={panelCardClass}>
-            <div class={panelLabelClass}>Active Graph</div>
-            <div class={css({ mt: '8px', fontSize: '11px', fontFamily: 'var(--font-mono)', color: 'fg.muted' })}>{active().graph_id}</div>
-            <div class={css({ mt: '12px', display: 'flex', flexDir: 'column', gap: '8px' })}>
-              <For each={active().nodes}>
-                {(node) => {
-                  const status = () => latestStatus().get(node.call_id) ?? 'Queued';
-                  return (
-                    <div class={css({ p: '12px', borderRadius: '12px', bg: 'white/4', border: '1px solid', borderColor: graph().blocked_call_ids.includes(node.call_id) ? 'red.500/40' : 'white/8' })}>
-                      <div class={css({ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' })}>
-                        <span class={css({ fontWeight: '900', fontSize: '12px' })}>{node.skill_name}</span>
-                        <span class={css({ fontSize: '9px', fontWeight: '900', textTransform: 'uppercase', color: status() === 'Succeeded' ? 'green.400' : status() === 'Failed' || status() === 'TimedOut' ? 'red.400' : 'fg.muted' })}>{status()}</span>
-                      </div>
-                      <div class={css({ mt: '6px', fontSize: '10px', color: 'fg.muted' })}>
-                        priority {node.priority} · depends on {node.dependencies.length || 'none'} · attempts {node.retry_policy.policy.max_attempts}
-                      </div>
+        {(active) => {
+          // Pre-calculate node dependency levels for a visual DAG representation
+          const levels = createMemo(() => {
+            const nodeMap = new Map<string, any>();
+            active().nodes.forEach(n => nodeMap.set(n.call_id, n));
+            
+            const nodeLevels = new Map<string, number>();
+            
+            // Recursive function to determine depth
+            const getDepth = (callId: string, visited = new Set<string>()): number => {
+              if (nodeLevels.has(callId)) return nodeLevels.get(callId)!;
+              if (visited.has(callId)) return 0; // Avoid cycles just in case
+              
+              visited.add(callId);
+              const node = nodeMap.get(callId);
+              if (!node || !node.dependencies || node.dependencies.length === 0) {
+                nodeLevels.set(callId, 0);
+                return 0;
+              }
+              
+              const parentDepths = node.dependencies.map((dep: any) => getDepth(dep.call_id, new Set(visited)));
+              const depth = Math.max(0, ...parentDepths) + 1;
+              nodeLevels.set(callId, depth);
+              return depth;
+            };
+            
+            // Compute depths
+            active().nodes.forEach(n => getDepth(n.call_id));
+            
+            // Group by levels
+            const byLevel: Record<number, any[]> = {};
+            let maxLevel = 0;
+            
+            active().nodes.forEach(n => {
+              const level = nodeLevels.get(n.call_id) || 0;
+              maxLevel = Math.max(maxLevel, level);
+              if (!byLevel[level]) byLevel[level] = [];
+              byLevel[level].push(n);
+            });
+            
+            // Return ordered array of levels
+            const result = [];
+            for (let i = 0; i <= maxLevel; i++) {
+              if (byLevel[i] && byLevel[i].length > 0) {
+                // Sort within level by priority, then name
+                byLevel[i].sort((a, b) => {
+                  if (b.priority !== a.priority) return b.priority - a.priority;
+                  return a.skill_name.localeCompare(b.skill_name);
+                });
+                result.push(byLevel[i]);
+              }
+            }
+            return result;
+          });
+
+          return (
+            <div class={panelCardClass}>
+              <div class={css({ display: 'flex', justifyContent: 'space-between', alignItems: 'center' })}>
+                <div class={panelLabelClass}>Execution Graph</div>
+                <div class={css({ fontSize: '9px', fontFamily: 'var(--font-mono)', color: 'fg.muted', opacity: 0.5 })}>{active().graph_id.split('-').slice(0, 2).join('-')}</div>
+              </div>
+              
+              <div class={css({ mt: '16px', display: 'flex', flexDir: 'column', gap: '16px', position: 'relative' })}>
+                <div class={css({ position: 'absolute', top: 0, bottom: 0, left: '20px', width: '2px', bg: 'border.default', zIndex: 0, opacity: 0.3 })}></div>
+                
+                <For each={levels()}>
+                  {(levelNodes, levelIndex) => (
+                    <div class={css({ display: 'flex', flexDir: 'column', gap: '8px', position: 'relative', zIndex: 1 })}>
+                      <For each={levelNodes}>
+                        {(node) => {
+                          const status = () => latestStatus().get(node.call_id) ?? 'Queued';
+                          const isBlocked = () => graph().blocked_call_ids.includes(node.call_id);
+                          
+                          // Determine border/glow based on status
+                          const getNodeStyle = () => {
+                            if (isBlocked()) return css({ borderColor: 'red.500/40', bg: 'red.500/5' });
+                            
+                            switch (status()) {
+                              case 'Succeeded': return css({ borderColor: 'green.500/30', bg: 'green.500/5' });
+                              case 'Failed':
+                              case 'TimedOut': return css({ borderColor: 'red.500/40', bg: 'red.500/5' });
+                              case 'Running': return css({ borderColor: 'indigo.500/40', bg: 'indigo.500/10', boxShadow: '0 0 10px {colors.indigo.500/20}', animation: 'pulse 2s infinite' });
+                              case 'Queued':
+                              case 'Validated': return css({ borderColor: 'white/10', bg: 'white/2' });
+                              default: return css({ borderColor: 'white/10', bg: 'white/4' });
+                            }
+                          };
+
+                          const getStatusColor = () => {
+                            if (isBlocked()) return 'red.400';
+                            switch (status()) {
+                              case 'Succeeded': return 'green.400';
+                              case 'Failed':
+                              case 'TimedOut': return 'red.400';
+                              case 'Running': return 'indigo.400';
+                              default: return 'fg.muted';
+                            }
+                          };
+
+                          return (
+                            <div class={css({ display: 'flex', alignItems: 'center', gap: '12px', animation: 'fadeIn 0.3s ease-out', animationFillMode: 'both' })} style={{ "animation-delay": `${levelIndex() * 100}ms` }}>
+                              <div class={css({ w: '12px', h: '12px', borderRadius: 'full', bg: 'bg.subtle', border: '2px solid', borderColor: getStatusColor(), zIndex: 2 })}></div>
+                              
+                              <div class={cx(css({ flex: 1, p: '12px', borderRadius: '12px', border: '1px solid', transition: 'all 0.3s ease' }), getNodeStyle())}>
+                                <div class={css({ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' })}>
+                                  <div class={css({ display: 'flex', alignItems: 'center', gap: '8px' })}>
+                                    <span class={css({ fontWeight: '900', fontSize: '12px', color: 'fg.default' })}>{node.skill_name}</span>
+                                    <Show when={node.dependencies.length > 0}>
+                                      <span class={css({ fontSize: '9px', px: '4px', py: '1px', bg: 'white/5', borderRadius: '4px', color: 'fg.muted' })}>
+                                        Wait {node.dependencies.length}
+                                      </span>
+                                    </Show>
+                                  </div>
+                                  <span class={css({ fontSize: '9px', fontWeight: '900', textTransform: 'uppercase', color: getStatusColor() })}>
+                                    {isBlocked() ? 'Blocked' : status()}
+                                  </span>
+                                </div>
+                                <div class={css({ mt: '6px', fontSize: '10px', color: 'fg.muted', fontFamily: 'var(--font-mono)' })}>
+                                  {node.call_id.split('-').slice(0, 2).join('-')}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        }}
+                      </For>
                     </div>
-                  );
-                }}
-              </For>
+                  )}
+                </For>
+              </div>
             </div>
-          </div>
-        )}
+          );
+        }}
       </Show>
 
       <Show when={validationFailures().length > 0}>
