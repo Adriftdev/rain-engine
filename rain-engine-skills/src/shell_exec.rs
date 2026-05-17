@@ -13,6 +13,7 @@ use tracing::warn;
 pub struct ShellExecSkill {
     allowed_commands: HashSet<String>,
     timeout: Duration,
+    permissive: bool,
 }
 
 impl ShellExecSkill {
@@ -21,6 +22,7 @@ impl ShellExecSkill {
         Self {
             allowed_commands,
             timeout,
+            permissive: false,
         }
     }
 
@@ -29,12 +31,13 @@ impl ShellExecSkill {
         Self {
             allowed_commands: HashSet::new(),
             timeout,
+            permissive: true,
         }
     }
 
     fn is_allowed(&self, command: &str) -> bool {
-        if self.allowed_commands.is_empty() {
-            return true; // permissive mode
+        if self.permissive {
+            return true;
         }
         let executable = command.split_whitespace().next().unwrap_or("");
         self.allowed_commands.contains(executable)
@@ -113,5 +116,66 @@ impl NativeSkill for ShellExecSkill {
 
     fn executor_kind(&self) -> &'static str {
         "native:shell_exec"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rain_engine_core::{
+        AgentContextSnapshot, AgentId, AgentStateSnapshot, EnginePolicy, SkillInvocation,
+    };
+
+    fn invocation(command: &str) -> SkillInvocation {
+        SkillInvocation {
+            call_id: "call-1".to_string(),
+            manifest: manifest(),
+            args: json!({ "command": command }),
+            dry_run: false,
+            context: AgentContextSnapshot {
+                session_id: "session".to_string(),
+                granted_scopes: vec!["tool:run".to_string()],
+                trigger_id: "trigger".to_string(),
+                idempotency_key: None,
+                current_step: 0,
+                max_steps: 1,
+                history: Vec::new(),
+                prior_tool_results: Vec::new(),
+                session_cost_usd: 0.0,
+                state: AgentStateSnapshot {
+                    agent_id: AgentId("session".to_string()),
+                    profile: None,
+                    goals: Vec::new(),
+                    tasks: Vec::new(),
+                    observations: Vec::new(),
+                    artifacts: Vec::new(),
+                    resources: Vec::new(),
+                    relationships: Vec::new(),
+                    pending_wake: None,
+                },
+                policy: EnginePolicy::default(),
+                active_execution_plan: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_denies_by_default() {
+        let skill = ShellExecSkill::new(HashSet::new(), Duration::from_secs(1));
+        let err = skill
+            .execute(invocation("echo denied"))
+            .await
+            .expect_err("empty allowlist denies");
+        assert_eq!(err.kind, SkillFailureKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn explicit_permissive_mode_allows_commands() {
+        let skill = ShellExecSkill::permissive(Duration::from_secs(1));
+        let output = skill
+            .execute(invocation("printf allowed"))
+            .await
+            .expect("permissive command");
+        assert_eq!(output["stdout"], json!("allowed"));
     }
 }

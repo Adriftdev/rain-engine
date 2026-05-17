@@ -110,19 +110,19 @@ pub fn derive_skill_manifest(input: TokenStream) -> TokenStream {
                     input_schema: serde_json::to_value(schema).expect("schema serializes"),
                     required_scopes: vec![#(#scope_tokens),*],
                     capability_grants: vec![#(#capability_tokens),*],
-                    resource_policy: rain_engine_core::ResourcePolicy {
-                        timeout_ms: #timeout_ms,
-                        max_memory_bytes: #max_memory_bytes,
-                        max_fuel: #max_fuel_tokens,
-                        priority_class: 0,
-                        max_retries: 0,
-                        retry_backoff_ms: 250,
-                        dry_run_supported: false,
-                    },
-                    approval_required: #approval_required,
+                        resource_policy: rain_engine_core::ResourcePolicy {
+                            timeout_ms: #timeout_ms,
+                            max_memory_bytes: #max_memory_bytes,
+                            max_fuel: #max_fuel_tokens,
+                            priority_class: 0,
+                            retry_policy: rain_engine_core::RetryPolicy::default(),
+                            dry_run_supported: false,
+                        },
+                        approval_required: #approval_required,
+                        circuit_breaker_threshold: 0.5,
+                    }
                 }
             }
-        }
     })
 }
 

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-checks:
+    name: Rust Checks & Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install minimal stable with clippy and rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        
+      - name: Run tests
+        run: cargo test --workspace --all-targets --quiet
+
+  ui-build:
+    name: UI Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'rain-engine-ui/package-lock.json'
+          
+      - name: Install dependencies
+        working-directory: ./rain-engine-ui
+        run: npm ci || npm install
+        
+      - name: Build UI
+        working-directory: ./rain-engine-ui
+        run: npm run build

@@ -14,6 +14,7 @@ mod memory;
 mod models;
 mod policy;
 mod retrieval;
+mod skill_store;
 mod traits;
 mod types;
 
@@ -29,6 +30,7 @@ pub use models::*;
 #[allow(unused_imports)]
 pub use policy::*;
 pub use retrieval::*;
+pub use skill_store::*;
 #[allow(unused_imports)]
 pub use traits::*;
 #[allow(unused_imports)]

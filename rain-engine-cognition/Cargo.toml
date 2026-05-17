@@ -7,7 +7,9 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 rain-engine-core = { path = "../rain-engine-core" }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true

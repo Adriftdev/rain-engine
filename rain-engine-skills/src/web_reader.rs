@@ -1,26 +1,22 @@
-//! HTTP fetch skill with host allowlist.
-
 use async_trait::async_trait;
+use headless_chrome::{Browser, LaunchOptions};
 use rain_engine_core::{
     NativeSkill, SkillExecutionError, SkillFailureKind, SkillInvocation, SkillManifest,
 };
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
-pub struct HttpFetchSkill {
-    client: reqwest::Client,
+pub struct WebReaderSkill {
     allowed_hosts: HashSet<String>,
     timeout: Duration,
     permissive: bool,
 }
 
-impl HttpFetchSkill {
-    /// Create with host allowlist. Empty set = deny all.
+impl WebReaderSkill {
     pub fn new(allowed_hosts: HashSet<String>, timeout: Duration) -> Self {
         Self {
-            client: reqwest::Client::new(),
             allowed_hosts,
             timeout,
             permissive: false,
@@ -29,7 +25,6 @@ impl HttpFetchSkill {
 
     pub fn permissive(timeout: Duration) -> Self {
         Self {
-            client: reqwest::Client::new(),
             allowed_hosts: HashSet::new(),
             timeout,
             permissive: true,
@@ -42,22 +37,20 @@ impl HttpFetchSkill {
         }
         reqwest::Url::parse(url)
             .ok()
-            .and_then(|parsed: reqwest::Url| parsed.host_str().map(|h| h.to_string()))
+            .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
             .is_some_and(|host| self.allowed_hosts.contains(&host))
     }
 }
 
 pub fn manifest() -> SkillManifest {
     crate::base_manifest(
-        "http_fetch",
-        "Make an HTTP request and return the response. Hosts must be on the allowlist.",
+        "web_reader",
+        "Browse a URL using a headless browser to handle dynamic (JavaScript-rendered) content. Returns the page HTML.",
         json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "The URL to fetch" },
-                "method": { "type": "string", "description": "HTTP method (GET, POST, etc.)", "default": "GET" },
-                "headers": { "type": "object", "description": "Optional headers" },
-                "body": { "type": "string", "description": "Optional request body" }
+                "url": { "type": "string", "description": "The URL to browse" },
+                "wait_for_selector": { "type": "string", "description": "Optional CSS selector to wait for (e.g. '.content-ready') before returning" }
             },
             "required": ["url"]
         }),
@@ -65,73 +58,76 @@ pub fn manifest() -> SkillManifest {
 }
 
 #[async_trait]
-impl NativeSkill for HttpFetchSkill {
+impl NativeSkill for WebReaderSkill {
     async fn execute(&self, invocation: SkillInvocation) -> Result<Value, SkillExecutionError> {
-        let url = invocation.args["url"].as_str().ok_or_else(|| {
-            SkillExecutionError::new(SkillFailureKind::InvalidResponse, "missing 'url' arg")
-        })?;
+        let url = invocation.args["url"]
+            .as_str()
+            .ok_or_else(|| {
+                SkillExecutionError::new(SkillFailureKind::InvalidResponse, "missing 'url' arg")
+            })?
+            .to_string();
 
-        if !self.is_allowed(url) {
-            warn!(url = %url, "http_fetch: host not on allowlist");
+        if !self.is_allowed(&url) {
+            warn!(url = %url, "web_reader: host not on allowlist");
             return Err(SkillExecutionError::new(
                 SkillFailureKind::PermissionDenied,
                 "host not allowed",
             ));
         }
 
-        let method_str = invocation.args["method"].as_str().unwrap_or("GET");
-        let method: reqwest::Method = method_str.parse().map_err(|_| {
-            SkillExecutionError::new(
-                SkillFailureKind::InvalidResponse,
-                format!("invalid method: {method_str}"),
-            )
-        })?;
+        let wait_for_selector = invocation.args["wait_for_selector"]
+            .as_str()
+            .map(|s| s.to_string());
 
-        let mut builder = self.client.request(method, url).timeout(self.timeout);
+        info!(url = %url, "Launching headless browser for web_reader...");
 
-        if let Some(headers) = invocation.args["headers"].as_object() {
-            for (key, value) in headers {
-                if let Some(val) = value.as_str() {
-                    builder = builder.header(key.as_str(), val);
-                }
+        // headless_chrome is synchronous, so we move it to a blocking thread to avoid stalling the executor
+        let task = tokio::task::spawn_blocking(move || {
+            let browser = Browser::new(LaunchOptions::default())
+                .map_err(|err| format!("Failed to launch browser: {err}"))?;
+
+            let tab = browser
+                .new_tab()
+                .map_err(|err| format!("Failed to open tab: {err}"))?;
+
+            tab.navigate_to(&url)
+                .map_err(|err| format!("Navigation failed: {err}"))?;
+
+            if let Some(selector) = wait_for_selector {
+                tab.wait_for_element(&selector)
+                    .map_err(|err| format!("Wait for selector '{selector}' failed: {err}"))?;
+            } else {
+                tab.wait_until_navigated()
+                    .map_err(|err| format!("Wait for navigation failed: {err}"))?;
             }
-        }
 
-        if let Some(body) = invocation.args["body"].as_str() {
-            builder = builder.body(body.to_string());
-        }
+            let content = tab
+                .get_content()
+                .map_err(|err| format!("Failed to get content: {err}"))?;
 
-        let response = builder.send().await.map_err(|err| {
-            SkillExecutionError::new(SkillFailureKind::Internal, format!("request failed: {err}"))
-        })?;
-
-        let status = response.status().as_u16();
-        let response_headers: serde_json::Map<String, Value> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.to_string(),
-                    Value::String(v.to_str().unwrap_or_default().to_string()),
+            Ok::<Value, String>(json!({
+                "url": url,
+                "content": content,
+            }))
+        });
+        let result = tokio::time::timeout(self.timeout, task)
+            .await
+            .map_err(|_| {
+                SkillExecutionError::new(SkillFailureKind::Timeout, "web_reader timed out")
+            })?
+            .map_err(|err| {
+                SkillExecutionError::new(
+                    SkillFailureKind::Internal,
+                    format!("Task panicked: {err}"),
                 )
-            })
-            .collect();
-        let body = response.text().await.map_err(|err| {
-            SkillExecutionError::new(
-                SkillFailureKind::Internal,
-                format!("body read failed: {err}"),
-            )
-        })?;
+            })?
+            .map_err(|err| SkillExecutionError::new(SkillFailureKind::Internal, err))?;
 
-        Ok(json!({
-            "status": status,
-            "headers": response_headers,
-            "body": body,
-        }))
+        Ok(result)
     }
 
     fn executor_kind(&self) -> &'static str {
-        "native:http_fetch"
+        "native:web_reader"
     }
 }
 
@@ -177,7 +173,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_allowlist_denies_by_default() {
-        let skill = HttpFetchSkill::new(HashSet::new(), Duration::from_secs(1));
+        let skill = WebReaderSkill::new(HashSet::new(), Duration::from_secs(1));
         let err = skill
             .execute(invocation("https://example.com"))
             .await

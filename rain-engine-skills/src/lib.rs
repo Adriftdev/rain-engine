@@ -8,8 +8,9 @@ pub mod file_ops;
 pub mod http_fetch;
 pub mod memory_search;
 pub mod shell_exec;
+pub mod web_reader;
 
-use rain_engine_core::SkillManifest;
+use rain_engine_core::{RetryPolicy, SkillManifest};
 
 /// Helper to build a SkillManifest with common defaults.
 fn base_manifest(name: &str, description: &str, input_schema: serde_json::Value) -> SkillManifest {
@@ -24,10 +25,15 @@ fn base_manifest(name: &str, description: &str, input_schema: serde_json::Value)
             max_memory_bytes: 16 * 1024 * 1024,
             max_fuel: None,
             priority_class: 0,
-            max_retries: 0,
-            retry_backoff_ms: 250,
+            retry_policy: RetryPolicy {
+                max_attempts: 0,
+                initial_interval_ms: 250,
+                backoff_multiplier: 2.0,
+                max_interval_ms: 10_000,
+            },
             dry_run_supported: false,
         },
         approval_required: false,
+        circuit_breaker_threshold: 0.5,
     }
 }

@@ -31,6 +31,7 @@ impl Default for ServerBuilder {
                 provider: ProviderBootstrapConfig::Mock {
                     response: "Mock Response".to_string(),
                 },
+                enable_research_planner: false,
             },
         }
     }
@@ -85,6 +86,7 @@ impl ServerBuilder {
             max_tokens: None,
             system_instruction: "You are a multimodal server-side automation agent. Use tools when they can complete the task precisely.".to_string(),
             provider_name: "gemini".to_string(),
+            embedding_model: "text-embedding-004".to_string(),
         };
         self
     }

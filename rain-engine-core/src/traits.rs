@@ -1,5 +1,8 @@
 #![allow(unused_imports)]
 
+use crate::{AgentStateSnapshot, AgentTrigger, KernelEvent};
+use async_trait::async_trait;
+
 pub use crate::blob::{BlobStore, BlobStoreError, InMemoryBlobStore};
 pub use crate::coordination::{
     CoordinationClaim, CoordinationError, CoordinationStore, InMemoryCoordinationStore,
@@ -10,3 +13,25 @@ pub use crate::memory::{InMemoryMemoryStore, MemoryError, MemoryStore, MemorySto
 pub use crate::retrieval::{
     RetrievalError, RetrievalStore, RetrievedItem, RetrievedItemKind, WorkingSet,
 };
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlannerOutput {
+    pub events: Vec<KernelEvent>,
+    pub proposed_plan: Option<crate::ExecutionPlan>,
+}
+
+#[async_trait]
+pub trait Planner: Send + Sync {
+    async fn plan(&self, state: &AgentStateSnapshot, trigger: &AgentTrigger) -> PlannerOutput;
+}
+
+#[async_trait]
+pub trait SkillStore: Send + Sync {
+    async fn store_skill(
+        &self,
+        manifest: crate::SkillManifest,
+        wasm_bytes: Vec<u8>,
+    ) -> Result<(), String>;
+    async fn list_skills(&self) -> Result<Vec<(crate::SkillManifest, Vec<u8>)>, String>;
+    async fn remove_skill(&self, name: &str) -> Result<(), String>;
+}

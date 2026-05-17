@@ -8,7 +8,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rain_engine_core::{
     AgentAction, AttachmentContent, AttachmentRef, LlmProvider, PlannedSkillCall,
     ProviderCacheRecord, ProviderContentPart, ProviderDecision, ProviderError, ProviderErrorKind,
-    ProviderRequest, ProviderRequestConfig, ProviderUsageRecord, SessionRecord,
+    ProviderRequest, ProviderUsageRecord, SessionRecord,
 };
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -25,9 +25,10 @@ pub enum GeminiAuth {
 pub struct GeminiConfig {
     pub base_url: String,
     pub auth: GeminiAuth,
-    pub default_request: ProviderRequestConfig,
+    pub default_request: rain_engine_core::ProviderRequestConfig,
     pub system_instruction: String,
     pub provider_name: String,
+    pub embedding_model: String,
 }
 
 impl GeminiConfig {
@@ -508,6 +509,86 @@ fn classify_status(status: StatusCode, body: String) -> ProviderError {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct GeminiEmbedRequest {
+    model: String,
+    content: GeminiContent,
+}
+
+#[derive(Debug, Serialize)]
+struct GeminiBatchEmbedRequest {
+    requests: Vec<GeminiEmbedRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiBatchEmbedResponse {
+    embeddings: Vec<GeminiEmbedding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiEmbedding {
+    values: Vec<f32>,
+}
+
+#[async_trait]
+impl rain_engine_core::EmbeddingProvider for GeminiProvider {
+    async fn generate_embeddings(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<Vec<Vec<f32>>, rain_engine_core::ProviderError> {
+        let model = format!("models/{}", self.config.embedding_model);
+        let requests = texts
+            .into_iter()
+            .map(|text| GeminiEmbedRequest {
+                model: model.clone(),
+                content: GeminiContent {
+                    role: "user".to_string(),
+                    parts: vec![GeminiPart {
+                        text: Some(text),
+                        inline_data: None,
+                        file_data: None,
+                        function_call: None,
+                        function_response: None,
+                    }],
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let response = self
+            .authorized(self.client.post(format!(
+                "{}/{}:batchEmbedContents",
+                self.config.base_url.trim_end_matches('/'),
+                model
+            )))
+            .json(&GeminiBatchEmbedRequest { requests })
+            .send()
+            .await
+            .map_err(|err| {
+                rain_engine_core::ProviderError::new(
+                    rain_engine_core::ProviderErrorKind::Transport,
+                    err.to_string(),
+                    true,
+                )
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(classify_status(status, body));
+        }
+
+        let body: GeminiBatchEmbedResponse = response.json().await.map_err(|err| {
+            rain_engine_core::ProviderError::new(
+                rain_engine_core::ProviderErrorKind::InvalidResponse,
+                err.to_string(),
+                false,
+            )
+        })?;
+
+        Ok(body.embeddings.into_iter().map(|e| e.values).collect())
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct GeminiContent {
     role: String,
@@ -647,8 +728,8 @@ mod tests {
     use axum::{Json, Router, extract::State, routing::post};
     use rain_engine_core::{
         AgentContextSnapshot, AgentId, AgentStateSnapshot, AgentTrigger, AttachmentRef,
-        EnginePolicy, ProviderMessage, ProviderRole, ResourcePolicy, SkillDefinition,
-        SkillManifest,
+        EnginePolicy, ProviderMessage, ProviderRequestConfig, ProviderRole, ResourcePolicy,
+        SkillDefinition, SkillManifest,
     };
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -699,6 +780,8 @@ mod tests {
                     relationships: Vec::new(),
                     pending_wake: None,
                 },
+                policy: EnginePolicy::default(),
+                active_execution_plan: None,
             },
             available_skills: vec![SkillDefinition {
                 manifest: SkillManifest {
@@ -709,6 +792,7 @@ mod tests {
                     capability_grants: vec![],
                     resource_policy: ResourcePolicy::default_for_tools(),
                     approval_required: false,
+                    circuit_breaker_threshold: 0.5,
                 },
                 executor_kind: "native".to_string(),
             }],
@@ -798,6 +882,7 @@ mod tests {
             default_request: ProviderRequestConfig::default(),
             system_instruction: "You are helpful".to_string(),
             provider_name: "gemini".to_string(),
+            embedding_model: "text-embedding-004".to_string(),
         })
         .expect("provider");
 
@@ -828,6 +913,7 @@ mod tests {
             default_request: ProviderRequestConfig::default(),
             system_instruction: "You are helpful".to_string(),
             provider_name: "gemini".to_string(),
+            embedding_model: "text-embedding-004".to_string(),
         })
         .expect("provider");
 

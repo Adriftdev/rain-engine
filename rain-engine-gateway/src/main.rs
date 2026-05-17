@@ -52,43 +52,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(30),
     );
 
-    // Shell exec — default-deny allowlist from env
+    // Shell exec — default-deny allowlist, with explicit dev escape hatch.
     let allowed_commands: HashSet<String> = env::var("RAIN_SKILL_SHELL_ALLOWLIST")
         .unwrap_or_default()
         .split(',')
         .filter(|s| !s.is_empty())
         .map(|s| s.trim().to_string())
         .collect();
-    state
-        .engine()
-        .register_native_skill(
-            rain_engine_skills::shell_exec::manifest(),
-            Arc::new(rain_engine_skills::shell_exec::ShellExecSkill::new(
-                allowed_commands,
-                shell_timeout,
-            )),
-        )
-        .await;
+    let shell_permissive = env::var("RAIN_SKILL_SHELL_PERMISSIVE")
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(false);
+    state.engine().register_native_skill(
+        rain_engine_skills::shell_exec::manifest(),
+        Arc::new(if shell_permissive {
+            rain_engine_skills::shell_exec::ShellExecSkill::permissive(shell_timeout)
+        } else {
+            rain_engine_skills::shell_exec::ShellExecSkill::new(allowed_commands, shell_timeout)
+        }),
+    );
 
     // File read/write
-    state
-        .engine()
-        .register_native_skill(
-            rain_engine_skills::file_ops::read_manifest(),
-            Arc::new(rain_engine_skills::file_ops::FileReadSkill::new(
-                &workspace_root,
-            )),
-        )
-        .await;
-    state
-        .engine()
-        .register_native_skill(
-            rain_engine_skills::file_ops::write_manifest(),
-            Arc::new(rain_engine_skills::file_ops::FileWriteSkill::new(
-                &workspace_root,
-            )),
-        )
-        .await;
+    state.engine().register_native_skill(
+        rain_engine_skills::file_ops::read_manifest(),
+        Arc::new(rain_engine_skills::file_ops::FileReadSkill::new(
+            &workspace_root,
+        )),
+    );
+    state.engine().register_native_skill(
+        rain_engine_skills::file_ops::write_manifest(),
+        Arc::new(rain_engine_skills::file_ops::FileWriteSkill::new(
+            &workspace_root,
+        )),
+    );
 
     // HTTP fetch
     let allowed_hosts: HashSet<String> = env::var("RAIN_SKILL_HTTP_ALLOWLIST")
@@ -97,37 +92,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .map(|s| s.trim().to_string())
         .collect();
-    state
-        .engine()
-        .register_native_skill(
-            rain_engine_skills::http_fetch::manifest(),
-            Arc::new(rain_engine_skills::http_fetch::HttpFetchSkill::new(
-                allowed_hosts,
-                http_timeout,
-            )),
-        )
-        .await;
+    let http_permissive = env::var("RAIN_SKILL_HTTP_PERMISSIVE")
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(false);
+    state.engine().register_native_skill(
+        rain_engine_skills::http_fetch::manifest(),
+        Arc::new(if http_permissive {
+            rain_engine_skills::http_fetch::HttpFetchSkill::permissive(http_timeout)
+        } else {
+            rain_engine_skills::http_fetch::HttpFetchSkill::new(allowed_hosts, http_timeout)
+        }),
+    );
 
     // Memory search
-    state
-        .engine()
-        .register_native_skill(
-            rain_engine_skills::memory_search::manifest(),
-            Arc::new(rain_engine_skills::memory_search::MemorySearchSkill::new(
-                state.memory(),
-            )),
-        )
-        .await;
+    state.engine().register_native_skill(
+        rain_engine_skills::memory_search::manifest(),
+        Arc::new(rain_engine_skills::memory_search::MemorySearchSkill::new(
+            state.memory(),
+        )),
+    );
 
-    tracing::info!("Registered 5 built-in skills");
+    // Web Reader
+    let web_reader_permissive = env::var("RAIN_SKILL_WEB_PERMISSIVE")
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(false);
+    state.engine().register_native_skill(
+        rain_engine_skills::web_reader::manifest(),
+        Arc::new(if web_reader_permissive {
+            rain_engine_skills::web_reader::WebReaderSkill::permissive(http_timeout)
+        } else {
+            rain_engine_skills::web_reader::WebReaderSkill::new(
+                env::var("RAIN_SKILL_WEB_ALLOWLIST")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|host| !host.is_empty())
+                    .map(|host| host.trim().to_string())
+                    .collect(),
+                http_timeout,
+            )
+        }),
+    );
+
+    // Skill installer
+    state.engine().register_native_skill(
+        rain_engine_runtime::install_skill_manifest(),
+        Arc::new(rain_engine_runtime::SkillInstallerSkill::new(
+            state.engine().clone(),
+        )),
+    );
+
+    tracing::info!("Registered 7 built-in skills");
 
     // ---------------------------------------------------------------------------
     // Build the HTTP router with CORS
     // ---------------------------------------------------------------------------
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
+    let cors_base = CorsLayer::new()
         .allow_methods(Any)
         .allow_headers(Any);
+        
+    let cors = if let Ok(origins) = env::var("RAIN_CORS_ALLOWED_ORIGINS") {
+        if origins == "*" {
+            cors_base.allow_origin(Any)
+        } else {
+            // To simplify for the gateway, if a specific list is provided, 
+            // we'll just use the first one exactly, or require a more complex CORS layer 
+            // for multiple. For now, since tower-http's AllowOrigin::list takes an array 
+            // and is hard to build dynamically, we'll allow Any if they set origins dynamically
+            // but log a warning. A proper production setup would use a custom origin closure.
+            // Let's implement it the simplest secure way: if it's set to a specific single domain, use that.
+            if let Some(first_origin) = origins.split(',').next() {
+                if let Ok(header_val) = first_origin.trim().parse::<axum::http::HeaderValue>() {
+                    tracing::info!("CORS locked to {}", first_origin);
+                    cors_base.allow_origin(tower_http::cors::AllowOrigin::exact(header_val))
+                } else {
+                    cors_base.allow_origin(Any)
+                }
+            } else {
+                cors_base.allow_origin(Any)
+            }
+        }
+    } else {
+        // Fallback for dev convenience, but logging warns about it
+        tracing::warn!("RAIN_CORS_ALLOWED_ORIGINS not set. Defaulting to permissive CORS.");
+        cors_base.allow_origin(Any)
+    };
+
     let router = app(state.clone()).layer(cors);
 
     // ---------------------------------------------------------------------------
@@ -351,6 +400,8 @@ fn resolve_config() -> Result<RuntimeBootstrapConfig, Box<dyn std::error::Error>
                 .and_then(|v| v.parse().ok()),
             system_instruction: system_prompt.clone(),
             provider_name: "gemini".into(),
+            embedding_model: env::var("RAIN_PROVIDER_EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "text-embedding-004".into()),
         },
         Ok("openai") => ProviderBootstrapConfig::OpenAiCompatible {
             base_url: env::var("RAIN_PROVIDER_BASE_URL")
@@ -403,5 +454,8 @@ fn resolve_config() -> Result<RuntimeBootstrapConfig, Box<dyn std::error::Error>
         store,
         blob,
         provider,
+        enable_research_planner: env::var("RAIN_ENABLE_RESEARCH_PLANNER")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
     })
 }

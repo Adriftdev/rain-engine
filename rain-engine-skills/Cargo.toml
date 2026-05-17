@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+headless_chrome = { workspace = true }
 rain-engine-core = { path = "../rain-engine-core" }
 rain-engine-memory = { path = "../rain-engine-memory" }
 reqwest = { workspace = true }

@@ -439,6 +439,8 @@ mod tests {
                     relationships: Vec::new(),
                     pending_wake: None,
                 },
+                policy: EnginePolicy::default(),
+                active_execution_plan: None,
             },
             available_skills: vec![SkillDefinition {
                 manifest: SkillManifest {
@@ -449,6 +451,7 @@ mod tests {
                     capability_grants: vec![],
                     resource_policy: rain_engine_core::ResourcePolicy::default_for_tools(),
                     approval_required: false,
+                    circuit_breaker_threshold: 0.5,
                 },
                 executor_kind: "wasm".to_string(),
             }],

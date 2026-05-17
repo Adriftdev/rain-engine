@@ -1,11 +1,12 @@
 use crate::{
     ApprovalResolutionRecord, CoordinationClaimRecord, DelegationRecord, DeliberationRecord,
-    EngineOutcome, KernelEventRecord, ModelDecisionRecord, NewSessionRecord, OutcomeRecord,
-    PendingApprovalRecord, PolicyTuningRecord, ProfilePatchRecord, ProviderCacheRecord,
-    ProviderUsageRecord, RecordPage, RecordPageQuery, ReflectionRecord, SessionListQuery,
-    SessionRecord, SessionSnapshot, SessionSummary, SkillInputValidationRecord,
-    StoredSessionRecord, StrategyPreferenceRecord, ToolCallRecord, ToolExecutionGraph,
-    ToolNodeCheckpointRecord, ToolPerformanceRecord, ToolResultRecord, TriggerRecord,
+    EngineOutcome, ExecutionPlanRecord, KernelEventRecord, ModelDecisionRecord, NewSessionRecord,
+    OutcomeRecord, PendingApprovalRecord, PolicyTuningRecord, ProfilePatchRecord,
+    ProviderCacheRecord, ProviderUsageRecord, RecordPage, RecordPageQuery, ReflectionRecord,
+    SessionListQuery, SessionRecord, SessionSnapshot, SessionSummary, SkillInputValidationRecord,
+    StoredSessionRecord, StrategyPreferenceRecord, SummaryRecord, ToolCallRecord,
+    ToolExecutionGraph, ToolNodeCheckpointRecord, ToolPerformanceRecord, ToolResultRecord,
+    TriggerIntentRecord, TriggerRecord,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -81,6 +82,18 @@ pub trait MemoryStoreExt: MemoryStore {
         .await
     }
 
+    async fn append_trigger_intent(
+        &self,
+        session_id: &str,
+        record: TriggerIntentRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::TriggerIntent(record),
+        ))
+        .await
+    }
+
     async fn append_deliberation(
         &self,
         session_id: &str,
@@ -101,6 +114,30 @@ pub trait MemoryStoreExt: MemoryStore {
         self.append_record(NewSessionRecord::from_record(
             session_id.to_string(),
             SessionRecord::ToolExecutionGraph(record),
+        ))
+        .await
+    }
+
+    async fn append_execution_plan(
+        &self,
+        session_id: &str,
+        record: ExecutionPlanRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::ExecutionPlan(record),
+        ))
+        .await
+    }
+
+    async fn append_summary(
+        &self,
+        session_id: &str,
+        record: SummaryRecord,
+    ) -> Result<StoredSessionRecord, MemoryError> {
+        self.append_record(NewSessionRecord::from_record(
+            session_id.to_string(),
+            SessionRecord::Summary(record),
         ))
         .await
     }

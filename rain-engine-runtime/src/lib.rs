@@ -3,6 +3,7 @@
 //! The runtime owns request parsing and repeated calls to `AgentEngine::advance`
 //! until a terminal, suspended, delegated, or policy-stopped outcome is reached.
 
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::to_bytes,
@@ -16,10 +17,11 @@ use rain_engine_blob::{BlobBackendConfig, build_blob_store};
 use rain_engine_core::{
     AdvanceRequest, AgentEngine, AgentStateSnapshot, AgentTrigger, ApprovalDecision, AttachmentRef,
     BlobStore, ContinueRequest, CorrelationId, EngineError, EngineOutcome, EnginePolicy,
-    InMemoryMemoryStore, LlmProvider, MemoryStore, MockLlmProvider, MultimodalPayload,
-    PendingApprovalRecord, ProcessRequest, ProviderRequestConfig, RecordPageQuery,
-    SessionListQuery, SessionRecord, SessionSnapshot, SkillDefinition, StopReason, ToolCallRecord,
-    ToolResultRecord, WakeId, unix_time_ms,
+    InMemoryMemoryStore, LlmProvider, MemoryStore, MockLlmProvider, MultimodalPayload, NativeSkill,
+    PendingApprovalRecord, ProcessRequest, ProviderRequestConfig, RecordPageQuery, ResourcePolicy,
+    SessionListQuery, SessionRecord, SessionSnapshot, SkillCapability, SkillDefinition,
+    SkillExecutionError, SkillFailureKind, SkillInvocation, SkillManifest, SkillStore, StopReason,
+    ToolCallRecord, ToolResultRecord, WakeId, unix_time_ms,
 };
 use rain_engine_openai::{OpenAiCompatibleConfig, OpenAiCompatibleProvider};
 use rain_engine_provider_gemini::{GeminiAuth, GeminiConfig, GeminiProvider};
@@ -27,11 +29,12 @@ use rain_engine_store_pg::PgMemoryStore;
 use rain_engine_store_sqlite::SqliteMemoryStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 const MAX_INGRESS_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -136,6 +139,143 @@ pub struct DelegationResultIngressRequest {
 
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstallSkillRequest {
+    pub manifest: rain_engine_core::SkillManifest,
+    pub wasm_url: String,
+}
+
+pub struct SkillInstallerSkill {
+    engine: AgentEngine,
+}
+
+impl SkillInstallerSkill {
+    pub fn new(engine: AgentEngine) -> Self {
+        Self { engine }
+    }
+}
+
+pub fn install_skill_manifest() -> SkillManifest {
+    SkillManifest {
+        name: "install_skill".to_string(),
+        description: "Installs a new WASM-based skill from a URL.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "wasm_url": { "type": "string" },
+                "input_schema": { "type": "object" }
+            },
+            "required": ["name", "description", "wasm_url", "input_schema"]
+        }),
+        required_scopes: vec![],
+        capability_grants: vec![],
+        resource_policy: ResourcePolicy::default_for_tools(),
+        approval_required: true,
+        circuit_breaker_threshold: 0.5,
+    }
+}
+
+#[async_trait]
+impl NativeSkill for SkillInstallerSkill {
+    async fn execute(&self, invocation: SkillInvocation) -> Result<Value, SkillExecutionError> {
+        let name = invocation
+            .args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing name")
+            })?;
+        let description = invocation
+            .args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing description")
+            })?;
+        let wasm_url = invocation
+            .args
+            .get("wasm_url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing wasm_url")
+            })?;
+        let input_schema = invocation
+            .args
+            .get("input_schema")
+            .cloned()
+            .ok_or_else(|| {
+                SkillExecutionError::new(SkillFailureKind::InvalidArguments, "missing input_schema")
+            })?;
+
+        let manifest = SkillManifest {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema,
+            required_scopes: vec![],
+            capability_grants: vec![
+                SkillCapability::HttpOutbound {
+                    allow_hosts: vec![],
+                },
+                SkillCapability::StructuredLog,
+            ],
+            resource_policy: ResourcePolicy::default_for_tools(),
+            approval_required: false,
+            circuit_breaker_threshold: 0.5,
+        };
+
+        // Reuse the handler logic or just do it here
+        let client = reqwest::Client::new();
+        let wasm_bytes = client
+            .get(wasm_url)
+            .send()
+            .await
+            .map_err(|err| {
+                SkillExecutionError::new(
+                    SkillFailureKind::Internal,
+                    format!("Download failed: {}", err),
+                )
+            })?
+            .bytes()
+            .await
+            .map_err(|err| {
+                SkillExecutionError::new(
+                    SkillFailureKind::Internal,
+                    format!("Read failed: {}", err),
+                )
+            })?;
+
+        let config = rain_engine_wasm::WasmSkillConfig {
+            manifest: manifest.clone(),
+            wasm_bytes: Arc::new(wasm_bytes.to_vec()),
+            capabilities: Arc::new(
+                rain_engine_wasm::InMemoryCapabilityHost::new().with_http_client(),
+            ),
+        };
+
+        let executor = rain_engine_wasm::WasmSkillExecutor::new(config).map_err(|err| {
+            SkillExecutionError::new(SkillFailureKind::Internal, format!("Init failed: {}", err))
+        })?;
+
+        self.engine
+            .register_wasm_skill_persistent(manifest, Arc::new(executor), wasm_bytes.to_vec())
+            .await
+            .map_err(|err| {
+                SkillExecutionError::new(
+                    SkillFailureKind::Internal,
+                    format!("Storage failed: {err}"),
+                )
+            })?;
+
+        Ok(serde_json::json!({
+            "status": "success",
+            "message": format!("Skill {} installed successfully", name)
+        }))
+    }
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeServerConfig {
     pub bind_address: SocketAddr,
     pub request_timeout_ms: u64,
@@ -195,6 +335,8 @@ pub enum ProviderBootstrapConfig {
         system_instruction: String,
         #[serde(default = "default_gemini_provider_name")]
         provider_name: String,
+        #[serde(default = "default_gemini_embedding_model")]
+        embedding_model: String,
     },
 }
 
@@ -210,6 +352,10 @@ fn default_gemini_provider_name() -> String {
     "gemini".to_string()
 }
 
+fn default_gemini_embedding_model() -> String {
+    "text-embedding-004".to_string()
+}
+
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeBootstrapConfig {
@@ -217,6 +363,8 @@ pub struct RuntimeBootstrapConfig {
     pub store: StoreBootstrapConfig,
     pub blob: BlobBootstrapConfig,
     pub provider: ProviderBootstrapConfig,
+    #[serde(default)]
+    pub enable_research_planner: bool,
 }
 
 #[derive(Clone)]
@@ -457,43 +605,61 @@ pub async fn build_runtime_state(
     }
     .to_string();
 
-    let memory: Arc<dyn MemoryStore> = match &config.store {
-        StoreBootstrapConfig::InMemory => Arc::new(InMemoryMemoryStore::new()),
-        StoreBootstrapConfig::Sqlite { database_url } => {
-            if database_url.trim().is_empty() {
-                return Err(RuntimeConfigError::Invalid(
-                    "sqlite database_url must not be empty".to_string(),
-                ));
+    let (memory, skill_store): (Arc<dyn MemoryStore>, Option<Arc<dyn SkillStore>>) =
+        match &config.store {
+            StoreBootstrapConfig::InMemory => (
+                Arc::new(InMemoryMemoryStore::new()),
+                Some(Arc::new(rain_engine_core::InMemorySkillStore::new()) as Arc<dyn SkillStore>),
+            ),
+            StoreBootstrapConfig::Sqlite { database_url } => {
+                if database_url.trim().is_empty() {
+                    return Err(RuntimeConfigError::Invalid(
+                        "sqlite database_url must not be empty".to_string(),
+                    ));
+                }
+                let store = Arc::new(
+                    SqliteMemoryStore::connect(database_url)
+                        .await
+                        .map_err(|err| RuntimeConfigError::Invalid(err.message))?,
+                );
+                (
+                    store.clone() as Arc<dyn MemoryStore>,
+                    Some(store as Arc<dyn SkillStore>),
+                )
             }
-            Arc::new(
-                SqliteMemoryStore::connect(database_url)
-                    .await
-                    .map_err(|err| RuntimeConfigError::Invalid(err.message))?,
-            )
-        }
-        StoreBootstrapConfig::Postgres { database_url } => {
-            if database_url.trim().is_empty() {
-                return Err(RuntimeConfigError::Invalid(
-                    "postgres database_url must not be empty".to_string(),
-                ));
+            StoreBootstrapConfig::Postgres { database_url } => {
+                if database_url.trim().is_empty() {
+                    return Err(RuntimeConfigError::Invalid(
+                        "postgres database_url must not be empty".to_string(),
+                    ));
+                }
+                (
+                    Arc::new(
+                        PgMemoryStore::connect_lazy(database_url)
+                            .map_err(|err| RuntimeConfigError::Invalid(err.message))?,
+                    ),
+                    None,
+                )
             }
-            Arc::new(
-                PgMemoryStore::connect_lazy(database_url)
-                    .map_err(|err| RuntimeConfigError::Invalid(err.message))?,
-            )
-        }
-    };
+        };
 
     let blob_store: Arc<dyn BlobStore> = Arc::from(
         build_blob_store(&config.blob).map_err(|err| RuntimeConfigError::Invalid(err.message))?,
     );
 
     let llm: Arc<dyn LlmProvider> = match &config.provider {
-        ProviderBootstrapConfig::Mock { response } => Arc::new(MockLlmProvider::scripted(vec![
-            rain_engine_core::AgentAction::Respond {
-                content: response.clone(),
-            },
-        ])),
+        ProviderBootstrapConfig::Mock { response } => {
+            let response_str = response.clone();
+            Arc::new(MockLlmProvider::dynamic(move |_| {
+                Ok(rain_engine_core::ProviderDecision {
+                    action: rain_engine_core::AgentAction::Respond {
+                        content: response_str.clone(),
+                    },
+                    usage: None,
+                    cache: None,
+                })
+            }))
+        }
         ProviderBootstrapConfig::OpenAiCompatible {
             base_url,
             api_key,
@@ -523,6 +689,7 @@ pub async fn build_runtime_state(
             max_tokens,
             system_instruction,
             provider_name,
+            embedding_model,
         } => Arc::new(
             GeminiProvider::new(GeminiConfig {
                 base_url: base_url.clone(),
@@ -537,18 +704,58 @@ pub async fn build_runtime_state(
                 },
                 system_instruction: system_instruction.clone(),
                 provider_name: provider_name.clone(),
+                embedding_model: embedding_model.clone(),
             })
             .map_err(|err| RuntimeConfigError::Invalid(err.to_string()))?,
         ),
     };
 
-    Ok(RuntimeState::new(
-        AgentEngine::new(llm, memory.clone()),
-        memory,
-        blob_store,
-        config.server,
-    )
-    .with_provider_kind(provider_kind))
+    let mut engine = AgentEngine::new(llm.clone(), memory.clone());
+    if let Some(store) = &skill_store {
+        engine = engine.with_skill_store(store.clone());
+
+        // Reload persisted WASM skills
+        if let Ok(persisted_skills) = store.list_skills().await {
+            info!("Reloading {} persisted skills...", persisted_skills.len());
+            for (manifest, wasm_bytes) in persisted_skills {
+                let config = rain_engine_wasm::WasmSkillConfig {
+                    manifest: manifest.clone(),
+                    wasm_bytes: Arc::new(wasm_bytes),
+                    capabilities: Arc::new(
+                        rain_engine_wasm::InMemoryCapabilityHost::new().with_http_client(),
+                    ),
+                };
+                match rain_engine_wasm::WasmSkillExecutor::new(config) {
+                    Ok(executor) => {
+                        engine.register_wasm_skill(manifest, Arc::new(executor));
+                    }
+                    Err(err) => {
+                        error!("Failed to reload skill {}: {}", manifest.name, err);
+                    }
+                }
+            }
+        }
+    }
+
+    engine.register_native_skill(
+        install_skill_manifest(),
+        Arc::new(SkillInstallerSkill::new(engine.clone())),
+    );
+
+    engine.register_native_skill(
+        rain_engine_skills::web_reader::manifest(),
+        Arc::new(rain_engine_skills::web_reader::WebReaderSkill::new(
+            HashSet::new(),
+            Duration::from_secs(30),
+        )),
+    );
+
+    if config.enable_research_planner {
+        engine = engine.with_planner(Arc::new(rain_engine_cognition::ResearchPlanner::new(llm)));
+    }
+
+    Ok(RuntimeState::new(engine, memory, blob_store, config.server)
+        .with_provider_kind(provider_kind))
 }
 
 pub fn app(state: RuntimeState) -> Router {
@@ -575,6 +782,8 @@ pub fn app(state: RuntimeState) -> Router {
             get(handle_get_execution_graph),
         )
         .route("/sessions/{session_id}/records", get(handle_list_records))
+        // Capabilities routes
+        .route("/capabilities/skills", post(handle_install_skill))
         // SSE streaming
         .route("/sessions/{session_id}/stream", get(handle_sse_stream))
         .with_state(state)
@@ -1132,6 +1341,56 @@ pub struct RecordListParams {
     pub until_ms: Option<i64>,
 }
 
+async fn handle_install_skill(
+    State(state): State<RuntimeState>,
+    Json(request): Json<InstallSkillRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    info!(
+        "Attempting to install skill: {} from {}",
+        request.manifest.name, request.wasm_url
+    );
+
+    let client = reqwest::Client::new();
+    let wasm_bytes = client
+        .get(&request.wasm_url)
+        .send()
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("Download failed: {}", err)))?
+        .bytes()
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("Read failed: {}", err)))?;
+
+    let config = rain_engine_wasm::WasmSkillConfig {
+        manifest: request.manifest.clone(),
+        wasm_bytes: Arc::new(wasm_bytes.to_vec()),
+        capabilities: Arc::new(rain_engine_wasm::InMemoryCapabilityHost::new().with_http_client()),
+    };
+
+    let executor = rain_engine_wasm::WasmSkillExecutor::new(config).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Init failed: {}", err),
+        )
+    })?;
+    let executor = Arc::new(executor);
+    state
+        .engine
+        .register_wasm_skill_persistent(request.manifest, executor.clone(), wasm_bytes.to_vec())
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage failed: {err}"),
+            )
+        })?;
+
+    info!(
+        "Skill successfully registered: {}",
+        executor.manifest().name
+    );
+    Ok(StatusCode::CREATED)
+}
+
 async fn handle_list_records(
     State(state): State<RuntimeState>,
     Path(session_id): Path<String>,
@@ -1377,6 +1636,21 @@ fn build_timeline(records: &[SessionRecord]) -> Vec<TimelineItem> {
                     content: content.clone(),
                     occurred_at_ms: unix_time_ms(trigger.recorded_at),
                 }),
+            },
+            SessionRecord::TriggerIntent(intent) => Some(TimelineItem::System {
+                label: "intent classified".to_string(),
+                detail: intent.intent.clone(),
+                occurred_at_ms: unix_time_ms(intent.classified_at),
+            }),
+            SessionRecord::KernelEvent(event) => match &event.event {
+                rain_engine_core::KernelEvent::WakeCompleted {
+                    wake_id, reason, ..
+                } => Some(TimelineItem::System {
+                    label: "wake completed".to_string(),
+                    detail: format!("{}: {}", wake_id.0, reason),
+                    occurred_at_ms: unix_time_ms(event.occurred_at),
+                }),
+                _ => None,
             },
             SessionRecord::Outcome(outcome) => outcome
                 .response
@@ -1864,21 +2138,19 @@ mod tests {
             blob_store,
             server_config(),
         );
-        state
-            .engine()
-            .register_native_skill(
-                SkillManifest {
-                    name: "dangerous_native".to_string(),
-                    description: "Requires approval".to_string(),
-                    input_schema: json!({"type":"object"}),
-                    required_scopes: vec!["tool:run".to_string()],
-                    capability_grants: vec![],
-                    resource_policy: rain_engine_core::ResourcePolicy::default_for_tools(),
-                    approval_required: true,
-                },
-                Arc::new(ApprovalNativeSkill),
-            )
-            .await;
+        state.engine().register_native_skill(
+            SkillManifest {
+                name: "dangerous_native".to_string(),
+                description: "Requires approval".to_string(),
+                input_schema: json!({"type":"object"}),
+                required_scopes: vec!["tool:run".to_string()],
+                capability_grants: vec![],
+                resource_policy: rain_engine_core::ResourcePolicy::default_for_tools(),
+                approval_required: true,
+                circuit_breaker_threshold: 0.5,
+            },
+            Arc::new(ApprovalNativeSkill),
+        );
 
         let start = app(state.clone())
             .oneshot(
@@ -1948,6 +2220,7 @@ mod tests {
             provider: ProviderBootstrapConfig::Mock {
                 response: "processed".to_string(),
             },
+            enable_research_planner: false,
         })
         .await;
 

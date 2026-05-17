@@ -377,19 +377,59 @@ export class RainEngineClient {
 
   /**
    * Subscribe to typed session stream events.
+   * Includes automatic reconnection logic with exponential backoff.
    */
-  streamSessionEvents(sessionId: string, handlers: SessionStreamHandlers): EventSource {
-    const source = this.streamSession(sessionId);
-    source.addEventListener('session_view', (event) => {
-      handlers.onView?.(JSON.parse((event as MessageEvent).data) as SessionView);
-    });
-    source.addEventListener('records', (event) => {
-      handlers.onRecords?.(JSON.parse((event as MessageEvent).data) as SessionRecord[]);
-    });
-    if (handlers.onError) {
-      source.addEventListener('error', handlers.onError);
-    }
-    return source;
+  streamSessionEvents(sessionId: string, handlers: SessionStreamHandlers): { close: () => void } {
+    let source: EventSource | null = null;
+    let reconnectAttempts = 0;
+    let isClosed = false;
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      if (isClosed) return;
+      
+      const url = `${this.baseUrl}sessions/${encodeURIComponent(sessionId)}/stream`;
+      source = new EventSource(url);
+      
+      source.addEventListener('open', () => {
+        reconnectAttempts = 0;
+      });
+
+      source.addEventListener('session_view', (event) => {
+        handlers.onView?.(JSON.parse((event as MessageEvent).data) as SessionView);
+      });
+      
+      source.addEventListener('records', (event) => {
+        handlers.onRecords?.(JSON.parse((event as MessageEvent).data) as SessionRecord[]);
+      });
+
+      source.addEventListener('error', (event) => {
+        // EventSource will try to reconnect automatically, but we might want
+        // to handle terminal errors or implement custom backoff if it fails completely
+        handlers.onError?.(event);
+        
+        if (source?.readyState === EventSource.CLOSED && !isClosed) {
+          reconnectAttempts++;
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000); // Max 30s
+          
+          if (retryTimeout) clearTimeout(retryTimeout);
+          retryTimeout = setTimeout(connect, delay);
+        }
+      });
+    };
+
+    connect();
+
+    return {
+      close: () => {
+        isClosed = true;
+        if (retryTimeout) clearTimeout(retryTimeout);
+        if (source) {
+          source.close();
+          source = null;
+        }
+      }
+    };
   }
 
   // ── Internal ──────────────────────────────────────────────────────
@@ -500,6 +540,33 @@ export function toTranscriptItems(records: SessionRecord[]): TimelineItem[] {
           occurred_at_ms: Date.parse((record.payload as any).recorded_at),
         },
       }];
+    }
+
+    if (record.type === 'TriggerIntent') {
+      const intent = record.payload as any;
+      return [{
+        type: 'System',
+        payload: {
+          label: 'intent classified',
+          detail: intent.intent,
+          occurred_at_ms: Date.parse(intent.classified_at),
+        },
+      }];
+    }
+
+    if (record.type === 'KernelEvent') {
+      const event = (record.payload as any).event;
+      if (event?.type === 'WakeCompleted') {
+        return [{
+          type: 'System',
+          payload: {
+            label: 'wake completed',
+            detail: `${event.payload.wake_id}: ${event.payload.reason}`,
+            occurred_at_ms: Date.parse((record.payload as any).occurred_at),
+          },
+        }];
+      }
+      return [];
     }
 
     if (record.type === 'Outcome') {

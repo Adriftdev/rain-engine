@@ -31,6 +31,7 @@ fn main() {
             max_tokens: Some(512),
             system_prompt: "You are a production automation agent.".to_string(),
         },
+        enable_research_planner: false,
     };
 
     println!("runtime_postgres bootstrap config: {:?}", config);

@@ -144,6 +144,14 @@ pub struct InMemoryCapabilityHost {
 }
 
 impl InMemoryCapabilityHost {
+    pub fn new() -> Self {
+        Self {
+            values: HashMap::new(),
+            logs: Mutex::new(Vec::new()),
+            http_enabled: false,
+        }
+    }
+
     pub fn with_value(mut self, namespace: &str, key: &str, value: Value) -> Self {
         self.values
             .insert((namespace.to_string(), key.to_string()), value);
@@ -257,6 +265,10 @@ impl WasmSkillExecutor {
             manifest: config.manifest,
             capabilities: config.capabilities,
         })
+    }
+
+    pub fn manifest(&self) -> &SkillManifest {
+        &self.manifest
     }
 
     fn build_store(&self) -> Result<Store<StoreState>, SkillExecutionError> {
@@ -644,7 +656,10 @@ fn classify_trap(message: String) -> SkillExecutionError {
 mod tests {
     use super::*;
     use axum::{Json, Router, routing::get};
-    use rain_engine_core::{AgentContextSnapshot, AgentId, AgentStateSnapshot, ResourcePolicy};
+    use rain_engine_core::{
+        AgentContextSnapshot, AgentId, AgentStateSnapshot, EnginePolicy, ResourcePolicy,
+        RetryPolicy,
+    };
     use serde_json::json;
 
     fn manifest(timeout_ms: u64, max_memory_bytes: usize) -> SkillManifest {
@@ -659,11 +674,11 @@ mod tests {
                 max_memory_bytes,
                 max_fuel: Some(1_000_000),
                 priority_class: 0,
-                max_retries: 0,
-                retry_backoff_ms: 250,
+                retry_policy: RetryPolicy::default(),
                 dry_run_supported: false,
             },
             approval_required: false,
+            circuit_breaker_threshold: 0.5,
         }
     }
 
@@ -694,6 +709,8 @@ mod tests {
                     relationships: Vec::new(),
                     pending_wake: None,
                 },
+                policy: EnginePolicy::default(),
+                active_execution_plan: None,
             },
         }
     }

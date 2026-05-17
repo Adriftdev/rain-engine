@@ -79,6 +79,11 @@ export type KernelEvent =
 	| { type: "ArtifactProduced", payload: ArtifactRecord }
 	| { type: "WakeRequested", payload: WakeRequestRecord }
 	| { type: "WakeScheduled", payload: WakeRequestRecord }
+	| { type: "WakeCompleted", payload: {
+	wake_id: WakeId;
+	completed_at: string;
+	reason: string;
+}}
 	| { type: "DelegationRequested", payload: DelegationRecord }
 	| { type: "DelegationResolved", payload: {
 	correlation_id: CorrelationId;
@@ -120,6 +125,7 @@ export interface AdvanceResult {
 
 export type SessionRecord = 
 	| { type: "Trigger", payload: TriggerRecord }
+	| { type: "TriggerIntent", payload: TriggerIntentRecord }
 	| { type: "KernelEvent", payload: KernelEventRecord }
 	| { type: "ModelDecision", payload: ModelDecisionRecord }
 	| { type: "Deliberation", payload: DeliberationRecord }
@@ -139,6 +145,8 @@ export type SessionRecord =
 	| { type: "StrategyPreference", payload: StrategyPreferenceRecord }
 	| { type: "ToolPerformance", payload: ToolPerformanceRecord }
 	| { type: "ProfilePatch", payload: ProfilePatchRecord }
+	| { type: "ExecutionPlan", payload: ExecutionPlanRecord }
+	| { type: "Summary", payload: SummaryRecord }
 	| { type: "Outcome", payload: OutcomeRecord };
 
 export interface ToolResultRecord {
@@ -149,8 +157,14 @@ export interface ToolResultRecord {
 }
 
 export interface ToolRetryPolicy {
-	max_retries: number;
-	retry_backoff_ms: number;
+	policy: RetryPolicy;
+}
+
+export interface RetryPolicy {
+	max_attempts: number;
+	initial_interval_ms: number;
+	backoff_multiplier: number;
+	max_interval_ms: number;
 }
 
 export interface ToolDependency {
@@ -359,6 +373,8 @@ export interface AgentContextSnapshot {
 	prior_tool_results: ToolResultRecord[];
 	session_cost_usd: number;
 	state: AgentStateSnapshot;
+	policy: EnginePolicy;
+	active_execution_plan?: ExecutionPlanRecord;
 }
 
 export enum ApprovalDecision {
@@ -521,6 +537,7 @@ export interface ModelDecisionRecord {
 
 export enum SessionRecordKind {
 	Trigger = "trigger",
+	TriggerIntent = "trigger_intent",
 	KernelEvent = "kernel_event",
 	ModelDecision = "model_decision",
 	Deliberation = "deliberation",
@@ -540,6 +557,8 @@ export enum SessionRecordKind {
 	StrategyPreference = "strategy_preference",
 	ToolPerformance = "tool_performance",
 	ProfilePatch = "profile_patch",
+	ExecutionPlan = "execution_plan",
+	Summary = "summary",
 	Outcome = "outcome",
 }
 
@@ -579,6 +598,22 @@ export interface PlannedSkillCall {
 	depends_on: string[];
 	retry_policy: ToolRetryPolicy;
 	dry_run: boolean;
+}
+
+export interface ExecutionPlanRecord {
+	plan_id: string;
+	created_at: string;
+	objective: string;
+	steps: AgentAction[];
+	current_step_index: number;
+	completed_at?: string;
+}
+
+export interface SummaryRecord {
+	summary_id: string;
+	created_at: string;
+	content: string;
+	original_sequence_range: [number, number];
 }
 
 export interface PendingApprovalRecord {
@@ -791,8 +826,7 @@ export interface ResourcePolicy {
 	max_memory_bytes: number;
 	max_fuel?: number;
 	priority_class: number;
-	max_retries: number;
-	retry_backoff_ms: number;
+	retry_policy: RetryPolicy;
 	dry_run_supported: boolean;
 }
 
@@ -804,6 +838,7 @@ export interface SkillManifest {
 	capability_grants: SkillCapability[];
 	resource_policy: ResourcePolicy;
 	approval_required: boolean;
+	circuit_breaker_threshold: number;
 }
 
 export interface SkillDefinition {
@@ -883,6 +918,7 @@ export type ProviderBootstrapConfig =
 	max_tokens?: number;
 	system_instruction: string;
 	provider_name: string;
+	embedding_model: string;
 }};
 
 export interface RuntimeBootstrapConfig {
@@ -890,6 +926,7 @@ export interface RuntimeBootstrapConfig {
 	store: StoreBootstrapConfig;
 	blob: BlobBootstrapConfig;
 	provider: ProviderBootstrapConfig;
+	enable_research_planner: boolean;
 }
 
 export interface RuntimeRunResult {
@@ -931,6 +968,7 @@ export interface SessionSummary {
 export enum SkillFailureKind {
 	PermissionDenied = "PermissionDenied",
 	CapabilityDenied = "CapabilityDenied",
+	InvalidArguments = "InvalidArguments",
 	Timeout = "Timeout",
 	MemoryLimitExceeded = "MemoryLimitExceeded",
 	Trap = "Trap",
@@ -947,6 +985,7 @@ export interface SkillInvocation {
 	call_id: string;
 	manifest: SkillManifest;
 	args: unknown;
+	dry_run: boolean;
 	context: AgentContextSnapshot;
 }
 
@@ -970,6 +1009,13 @@ export interface TriggerRecord {
 	idempotency_key?: string;
 	recorded_at: string;
 	trigger: AgentTrigger;
+	intent?: string;
+}
+
+export interface TriggerIntentRecord {
+	trigger_id: string;
+	classified_at: string;
+	intent: string;
 }
 
 export interface WebhookIngressRequest {

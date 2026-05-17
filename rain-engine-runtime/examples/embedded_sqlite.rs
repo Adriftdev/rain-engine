@@ -57,9 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ]));
     let engine = AgentEngine::new(llm, store);
-    engine
-        .register_skill(EchoInput::skill_manifest(), Arc::new(EchoExecutor))
-        .await;
+    engine.register_wasm_skill(EchoInput::skill_manifest(), Arc::new(EchoExecutor));
 
     let outcome = run_until_terminal(
         &engine,

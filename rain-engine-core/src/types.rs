@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
@@ -367,6 +367,11 @@ pub enum KernelEvent {
     ArtifactProduced(ArtifactRecord),
     WakeRequested(WakeRequestRecord),
     WakeScheduled(WakeRequestRecord),
+    WakeCompleted {
+        wake_id: WakeId,
+        completed_at: SystemTime,
+        reason: String,
+    },
     DelegationRequested(DelegationRecord),
     DelegationResolved {
         correlation_id: CorrelationId,
@@ -480,6 +485,17 @@ pub struct TriggerRecord {
     pub idempotency_key: Option<String>,
     pub recorded_at: SystemTime,
     pub trigger: AgentTrigger,
+    /// Deprecated compatibility field. New intent classifications are stored as
+    /// append-only `TriggerIntent` records.
+    pub intent: Option<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TriggerIntentRecord {
+    pub trigger_id: String,
+    pub classified_at: SystemTime,
+    pub intent: String,
 }
 
 #[typeshare::typeshare]
@@ -507,18 +523,28 @@ pub struct PlannedSkillCall {
 
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ToolRetryPolicy {
-    pub max_retries: usize,
-    pub retry_backoff_ms: u64,
+pub struct RetryPolicy {
+    pub max_attempts: usize,
+    pub initial_interval_ms: u64,
+    pub backoff_multiplier: f64,
+    pub max_interval_ms: u64,
 }
 
-impl Default for ToolRetryPolicy {
+impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            max_retries: 0,
-            retry_backoff_ms: 250,
+            max_attempts: 3,
+            initial_interval_ms: 250,
+            backoff_multiplier: 2.0,
+            max_interval_ms: 10_000,
         }
     }
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ToolRetryPolicy {
+    pub policy: RetryPolicy,
 }
 
 #[typeshare::typeshare]
@@ -650,6 +676,24 @@ pub enum AgentAction {
 
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionPlan {
+    pub objective: String,
+    pub steps: Vec<AgentAction>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionPlanRecord {
+    pub plan_id: String,
+    pub created_at: SystemTime,
+    pub objective: String,
+    pub steps: Vec<AgentAction>,
+    pub current_step_index: usize,
+    pub completed_at: Option<SystemTime>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelDecisionRecord {
     pub step: usize,
     pub decided_at: SystemTime,
@@ -657,7 +701,7 @@ pub struct ModelDecisionRecord {
 }
 
 #[typeshare::typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResourcePolicy {
     pub timeout_ms: u64,
     pub max_memory_bytes: usize,
@@ -665,9 +709,7 @@ pub struct ResourcePolicy {
     #[serde(default)]
     pub priority_class: i32,
     #[serde(default)]
-    pub max_retries: usize,
-    #[serde(default = "default_retry_backoff_ms")]
-    pub retry_backoff_ms: u64,
+    pub retry_policy: RetryPolicy,
     #[serde(default)]
     pub dry_run_supported: bool,
 }
@@ -679,8 +721,7 @@ impl ResourcePolicy {
             max_memory_bytes: 8 * 1024 * 1024,
             max_fuel: Some(10_000_000),
             priority_class: 0,
-            max_retries: 0,
-            retry_backoff_ms: default_retry_backoff_ms(),
+            retry_policy: RetryPolicy::default(),
             dry_run_supported: false,
         }
     }
@@ -691,15 +732,15 @@ impl ResourcePolicy {
             max_memory_bytes: self.max_memory_bytes.max(64 * 1024),
             max_fuel: self.max_fuel,
             priority_class: self.priority_class,
-            max_retries: self.max_retries,
-            retry_backoff_ms: self.retry_backoff_ms.max(1),
+            retry_policy: RetryPolicy {
+                max_attempts: self.retry_policy.max_attempts,
+                initial_interval_ms: self.retry_policy.initial_interval_ms.max(1),
+                backoff_multiplier: self.retry_policy.backoff_multiplier.max(1.0),
+                max_interval_ms: self.retry_policy.max_interval_ms.max(1),
+            },
             dry_run_supported: self.dry_run_supported,
         }
     }
-}
-
-fn default_retry_backoff_ms() -> u64 {
-    250
 }
 
 #[typeshare::typeshare]
@@ -729,6 +770,12 @@ pub struct SkillManifest {
     pub capability_grants: Vec<SkillCapability>,
     pub resource_policy: ResourcePolicy,
     pub approval_required: bool,
+    #[serde(default = "default_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: f64,
+}
+
+fn default_circuit_breaker_threshold() -> f64 {
+    0.5
 }
 
 impl SkillManifest {
@@ -1006,6 +1053,15 @@ pub struct ProfilePatchRecord {
     pub applied: bool,
 }
 
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SummaryRecord {
+    pub summary_id: String,
+    pub created_at: SystemTime,
+    pub content: String,
+    pub original_sequence_range: (usize, usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct SelfImprovementInput {
     pub session_id: String,
@@ -1058,6 +1114,7 @@ pub struct OutcomeRecord {
 #[serde(tag = "type", content = "payload")]
 pub enum SessionRecord {
     Trigger(TriggerRecord),
+    TriggerIntent(TriggerIntentRecord),
     KernelEvent(KernelEventRecord),
     ModelDecision(ModelDecisionRecord),
     Deliberation(DeliberationRecord),
@@ -1077,6 +1134,8 @@ pub enum SessionRecord {
     StrategyPreference(StrategyPreferenceRecord),
     ToolPerformance(ToolPerformanceRecord),
     ProfilePatch(ProfilePatchRecord),
+    ExecutionPlan(ExecutionPlanRecord),
+    Summary(SummaryRecord),
     Outcome(OutcomeRecord),
 }
 
@@ -1085,6 +1144,7 @@ pub enum SessionRecord {
 #[serde(rename_all = "snake_case")]
 pub enum SessionRecordKind {
     Trigger,
+    TriggerIntent,
     KernelEvent,
     ModelDecision,
     Deliberation,
@@ -1104,6 +1164,8 @@ pub enum SessionRecordKind {
     StrategyPreference,
     ToolPerformance,
     ProfilePatch,
+    ExecutionPlan,
+    Summary,
     Outcome,
 }
 
@@ -1111,6 +1173,7 @@ impl SessionRecordKind {
     pub fn as_str(self) -> &'static str {
         match self {
             SessionRecordKind::Trigger => "trigger",
+            SessionRecordKind::TriggerIntent => "trigger_intent",
             SessionRecordKind::KernelEvent => "kernel_event",
             SessionRecordKind::ModelDecision => "model_decision",
             SessionRecordKind::Deliberation => "deliberation",
@@ -1130,6 +1193,8 @@ impl SessionRecordKind {
             SessionRecordKind::StrategyPreference => "strategy_preference",
             SessionRecordKind::ToolPerformance => "tool_performance",
             SessionRecordKind::ProfilePatch => "profile_patch",
+            SessionRecordKind::ExecutionPlan => "execution_plan",
+            SessionRecordKind::Summary => "summary",
             SessionRecordKind::Outcome => "outcome",
         }
     }
@@ -1137,6 +1202,7 @@ impl SessionRecordKind {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "trigger" => Some(SessionRecordKind::Trigger),
+            "trigger_intent" => Some(SessionRecordKind::TriggerIntent),
             "kernel_event" => Some(SessionRecordKind::KernelEvent),
             "model_decision" => Some(SessionRecordKind::ModelDecision),
             "deliberation" => Some(SessionRecordKind::Deliberation),
@@ -1156,6 +1222,8 @@ impl SessionRecordKind {
             "strategy_preference" => Some(SessionRecordKind::StrategyPreference),
             "tool_performance" => Some(SessionRecordKind::ToolPerformance),
             "profile_patch" => Some(SessionRecordKind::ProfilePatch),
+            "execution_plan" => Some(SessionRecordKind::ExecutionPlan),
+            "summary" => Some(SessionRecordKind::Summary),
             "outcome" => Some(SessionRecordKind::Outcome),
             _ => None,
         }
@@ -1166,6 +1234,7 @@ impl SessionRecord {
     pub fn kind(&self) -> SessionRecordKind {
         match self {
             SessionRecord::Trigger(_) => SessionRecordKind::Trigger,
+            SessionRecord::TriggerIntent(_) => SessionRecordKind::TriggerIntent,
             SessionRecord::KernelEvent(_) => SessionRecordKind::KernelEvent,
             SessionRecord::ModelDecision(_) => SessionRecordKind::ModelDecision,
             SessionRecord::Deliberation(_) => SessionRecordKind::Deliberation,
@@ -1186,12 +1255,15 @@ impl SessionRecord {
             SessionRecord::ToolPerformance(_) => SessionRecordKind::ToolPerformance,
             SessionRecord::ProfilePatch(_) => SessionRecordKind::ProfilePatch,
             SessionRecord::Outcome(_) => SessionRecordKind::Outcome,
+            SessionRecord::ExecutionPlan(_) => SessionRecordKind::ExecutionPlan,
+            SessionRecord::Summary(_) => SessionRecordKind::Summary,
         }
     }
 
     pub fn occurred_at(&self) -> SystemTime {
         match self {
             SessionRecord::Trigger(record) => record.recorded_at,
+            SessionRecord::TriggerIntent(record) => record.classified_at,
             SessionRecord::KernelEvent(record) => record.occurred_at,
             SessionRecord::ModelDecision(record) => record.decided_at,
             SessionRecord::Deliberation(record) => record.created_at,
@@ -1212,12 +1284,15 @@ impl SessionRecord {
             SessionRecord::ToolPerformance(record) => record.created_at,
             SessionRecord::ProfilePatch(record) => record.created_at,
             SessionRecord::Outcome(record) => record.finished_at,
+            SessionRecord::ExecutionPlan(record) => record.created_at,
+            SessionRecord::Summary(record) => record.created_at,
         }
     }
 
     pub fn trigger_id(&self) -> Option<&str> {
         match self {
             SessionRecord::Trigger(record) => Some(&record.trigger_id),
+            SessionRecord::TriggerIntent(record) => Some(&record.trigger_id),
             SessionRecord::Deliberation(record) => Some(&record.trigger_id),
             SessionRecord::ToolExecutionGraph(record) => Some(&record.trigger_id),
             SessionRecord::PendingApproval(record) => Some(&record.trigger_id),
@@ -1351,6 +1426,24 @@ impl SessionSnapshot {
         })
     }
 
+    pub fn latest_trigger_intents(&self) -> HashMap<String, String> {
+        let mut intents = HashMap::new();
+        for record in &self.records {
+            match record {
+                SessionRecord::Trigger(trigger) => {
+                    if let Some(intent) = &trigger.intent {
+                        intents.insert(trigger.trigger_id.clone(), intent.clone());
+                    }
+                }
+                SessionRecord::TriggerIntent(intent) => {
+                    intents.insert(intent.trigger_id.clone(), intent.intent.clone());
+                }
+                _ => {}
+            }
+        }
+        intents
+    }
+
     pub fn reflections(&self) -> Vec<ReflectionRecord> {
         self.records
             .iter()
@@ -1359,6 +1452,13 @@ impl SessionSnapshot {
                 _ => None,
             })
             .collect()
+    }
+
+    pub fn active_execution_plan(&self) -> Option<ExecutionPlanRecord> {
+        self.records.iter().rev().find_map(|record| match record {
+            SessionRecord::ExecutionPlan(plan) if plan.completed_at.is_none() => Some(plan.clone()),
+            _ => None,
+        })
     }
 
     pub fn policy_tunings(&self) -> Vec<PolicyTuningRecord> {
@@ -1619,6 +1719,14 @@ impl SessionSnapshot {
                 }
                 KernelEvent::WakeRequested(wake) | KernelEvent::WakeScheduled(wake) => {
                     pending_wake = Some(wake)
+                }
+                KernelEvent::WakeCompleted { wake_id, .. } => {
+                    if pending_wake
+                        .as_ref()
+                        .is_some_and(|wake| wake.wake_id == wake_id)
+                    {
+                        pending_wake = None;
+                    }
                 }
                 KernelEvent::DelegationRequested(record) => {
                     let resource = ResourceRef {
@@ -1882,7 +1990,16 @@ impl AgentContext {
                 })
                 .sum(),
             state: snapshot.agent_state(),
+            policy: self.metadata.policy.clone(),
+            active_execution_plan: self.active_execution_plan(),
         }
+    }
+
+    pub fn active_execution_plan(&self) -> Option<ExecutionPlanRecord> {
+        self.records.iter().rev().find_map(|record| match record {
+            SessionRecord::ExecutionPlan(plan) if plan.completed_at.is_none() => Some(plan.clone()),
+            _ => None,
+        })
     }
 }
 
@@ -1899,6 +2016,8 @@ pub struct AgentContextSnapshot {
     pub prior_tool_results: Vec<ToolResultRecord>,
     pub session_cost_usd: f64,
     pub state: AgentStateSnapshot,
+    pub policy: EnginePolicy,
+    pub active_execution_plan: Option<ExecutionPlanRecord>,
 }
 
 #[derive(Debug, Clone)]

@@ -193,6 +193,7 @@ mod tests {
                     content: "hello".to_string(),
                     attachments: Vec::new(),
                 },
+                intent: None,
             })
             .await
             .expect("trigger");

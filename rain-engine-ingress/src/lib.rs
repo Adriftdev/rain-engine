@@ -4,13 +4,14 @@
 //! that drive the kernel through explicit advance loops.
 
 use rain_engine_core::{
-    AdvanceRequest, AgentEngine, AgentTrigger, ContinueRequest, EnginePolicy, ProcessRequest,
-    ProviderRequestConfig,
+    AdvanceRequest, AgentEngine, AgentTrigger, ContinueRequest, CoordinationStore, EnginePolicy,
+    ProcessRequest, ProviderRequestConfig,
 };
 use rain_engine_store_valkey::ValkeyCoordinationStore;
 use redis::cmd;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,7 +45,7 @@ pub enum IngressError {
 
 #[derive(Clone)]
 pub struct ValkeyStreamIngress {
-    _store: ValkeyCoordinationStore,
+    store: ValkeyCoordinationStore,
     config: ValkeyStreamConfig,
 }
 
@@ -52,10 +53,7 @@ impl ValkeyStreamIngress {
     pub fn new(config: ValkeyStreamConfig) -> Result<Self, IngressError> {
         let store = ValkeyCoordinationStore::connect(&config.url)
             .map_err(|err| IngressError::Message(err.message))?;
-        Ok(Self {
-            _store: store,
-            config,
-        })
+        Ok(Self { store, config })
     }
 
     pub async fn publish(&self, event: &IngressEventEnvelope) -> Result<String, IngressError> {
@@ -140,7 +138,21 @@ impl ValkeyStreamIngress {
         let Some((entry_id, event)) = parse_xreadgroup_payload(read)? else {
             return Ok(false);
         };
-        run_until_terminal(
+        let trigger_key = event
+            .idempotency_key
+            .clone()
+            .unwrap_or_else(|| entry_id.clone());
+        let Some(claim) = self
+            .store
+            .claim_trigger(&trigger_key, Duration::from_secs(300))
+            .await
+            .map_err(|err| IngressError::Message(err.message))?
+        else {
+            self.ack_entry(entry_id).await?;
+            return Ok(false);
+        };
+
+        let result = run_until_terminal(
             engine,
             ProcessRequest {
                 session_id: event.session_id.clone(),
@@ -152,9 +164,23 @@ impl ValkeyStreamIngress {
                 cancellation: tokio_util::sync::CancellationToken::new(),
             },
         )
-        .await
-        .map_err(|err| IngressError::Message(err.to_string()))?;
+        .await;
 
+        if let Err(err) = result {
+            let _ = self.store.release_claim(&claim.claim_id).await;
+            return Err(IngressError::Message(err.to_string()));
+        }
+
+        self.ack_entry(entry_id).await?;
+        self.store
+            .release_claim(&claim.claim_id)
+            .await
+            .map_err(|err| IngressError::Message(err.message))?;
+
+        Ok(true)
+    }
+
+    async fn ack_entry(&self, entry_id: String) -> Result<(), IngressError> {
         let client = redis::Client::open(self.config.url.clone())
             .map_err(|err| IngressError::Message(err.to_string()))?;
         let stream = self.config.stream.clone();
@@ -173,8 +199,7 @@ impl ValkeyStreamIngress {
         })
         .await
         .map_err(|err| IngressError::Message(err.to_string()))??;
-
-        Ok(true)
+        Ok(())
     }
 }
 

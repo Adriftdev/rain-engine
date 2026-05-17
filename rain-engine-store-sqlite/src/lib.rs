@@ -41,6 +41,20 @@ impl SqliteMemoryStore {
         .execute(&pool)
         .await
         .map_err(|err| MemoryError::new(err.to_string()))?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS skills (
+                name TEXT PRIMARY KEY,
+                manifest_json TEXT NOT NULL,
+                wasm_bytes BLOB NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .map_err(|err| MemoryError::new(err.to_string()))?;
+
         Ok(Self { pool })
     }
 
@@ -262,6 +276,71 @@ impl MemoryStore for SqliteMemoryStore {
             }
         }
         Ok(pending)
+    }
+}
+
+#[async_trait]
+impl rain_engine_core::SkillStore for SqliteMemoryStore {
+    async fn store_skill(
+        &self,
+        manifest: rain_engine_core::SkillManifest,
+        wasm_bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let manifest_json = serde_json::to_string(&manifest)
+            .map_err(|err| format!("Manifest serialization failed: {err}"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO skills (name, manifest_json, wasm_bytes)
+            VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                manifest_json = excluded.manifest_json,
+                wasm_bytes = excluded.wasm_bytes
+            "#,
+        )
+        .bind(&manifest.name)
+        .bind(manifest_json)
+        .bind(wasm_bytes)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| format!("Skill storage failed: {err}"))?;
+
+        Ok(())
+    }
+
+    async fn list_skills(&self) -> Result<Vec<(rain_engine_core::SkillManifest, Vec<u8>)>, String> {
+        let rows = sqlx::query(
+            r#"
+            SELECT manifest_json, wasm_bytes FROM skills
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| format!("Skill retrieval failed: {err}"))?;
+
+        let mut skills = Vec::with_capacity(rows.len());
+        for row in rows {
+            let manifest_json: &str = row.get("manifest_json");
+            let manifest: rain_engine_core::SkillManifest = serde_json::from_str(manifest_json)
+                .map_err(|err| format!("Manifest deserialization failed: {err}"))?;
+            let wasm_bytes: Vec<u8> = row.get("wasm_bytes");
+            skills.push((manifest, wasm_bytes));
+        }
+        Ok(skills)
+    }
+
+    async fn remove_skill(&self, name: &str) -> Result<(), String> {
+        sqlx::query(
+            r#"
+            DELETE FROM skills WHERE name = ?
+            "#,
+        )
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| format!("Skill removal failed: {err}"))?;
+
+        Ok(())
     }
 }
 

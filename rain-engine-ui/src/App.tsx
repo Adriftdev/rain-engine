@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
 import { css, cx } from 'styled-system/css';
 import { flex } from 'styled-system/patterns';
+import { SolidMarkdown } from 'solid-markdown';
 import {
   ApprovalDecision,
   RainEngineClient,
@@ -333,7 +334,9 @@ function TimelineRow(props: { item: TimelineItem }) {
       <div class={flex({ justify: 'flex-start', animation: 'fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1)' })}>
         <article class={assistantBubbleClass}>
           <div class={bubbleMetaClass}>Agent · {payload().stop_reason}</div>
-          <div class={css({ whiteSpace: 'pre-wrap', fontSize: '15px', lineHeight: '1.6' })}>{payload().content}</div>
+          <div class={css({ fontSize: '15px', lineHeight: '1.6' })}>
+            <SolidMarkdown children={payload().content} />
+          </div>
         </article>
       </div>
     );
@@ -634,7 +637,7 @@ function ExecutionGraphPanel(props: { view: SessionView }) {
                         <span class={css({ fontSize: '9px', fontWeight: '900', textTransform: 'uppercase', color: status() === 'Succeeded' ? 'green.400' : status() === 'Failed' || status() === 'TimedOut' ? 'red.400' : 'fg.muted' })}>{status()}</span>
                       </div>
                       <div class={css({ mt: '6px', fontSize: '10px', color: 'fg.muted' })}>
-                        priority {node.priority} · depends on {node.dependencies.length || 'none'} · retries {node.retry_policy.max_retries}
+                        priority {node.priority} · depends on {node.dependencies.length || 'none'} · attempts {node.retry_policy.policy.max_attempts}
                       </div>
                     </div>
                   );
@@ -888,11 +891,11 @@ const sidebarClass = flex({
   h: '100vh',
 });
 
-const mainClass = css({ flex: 1, minW: 0, bg: 'bg.canvas', position: 'relative' });
-const workbenchClass = css({ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 360px', h: '100vh' });
-const transcriptPaneClass = flex({ direction: 'column', minW: 0, h: 'full', bg: 'transparent', minH: 0 });
-const transcriptScrollClass = css({ flex: 1, overflowY: 'auto', px: '32px', py: '48px', minH: 0 });
-const inspectorClass = flex({ direction: 'column', bg: 'bg.sidebar', backdropFilter: 'blur(12px)', borderLeft: '1px solid', borderColor: 'border.default', minW: '360px', h: '100vh' });
+const mainClass = css({ flex: 1, minW: 0, bg: 'bg.canvas', position: 'relative', h: '100vh', overflow: 'hidden' });
+const workbenchClass = css({ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 360px', h: '100vh', overflow: 'hidden' });
+const transcriptPaneClass = flex({ direction: 'column', minW: 0, h: '100vh', bg: 'transparent', minH: 0, overflow: 'hidden' });
+const transcriptScrollClass = css({ flex: 1, overflowY: 'auto', px: '32px', py: '48px', minH: 0, scrollBehavior: 'smooth' });
+const inspectorClass = flex({ direction: 'column', bg: 'bg.sidebar', backdropFilter: 'blur(12px)', borderLeft: '1px solid', borderColor: 'border.default', minW: '360px', h: '100vh', overflow: 'hidden' });
 const sessionHeaderClass = css({ px: '32px', py: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid', borderColor: 'border.default', bg: 'hsla(240, 10%, 4%, 0.7)', backdropFilter: 'blur(12px)', position: 'sticky', top: 0, zIndex: 100 });
 const sessionButtonClass = css({ w: 'full', px: '16px', py: '12px', borderRadius: '12px', textAlign: 'left', cursor: 'pointer', border: '1px solid transparent', bg: 'transparent', transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)', _hover: { bg: 'bg.subtle', borderColor: 'border.default' } });
 const activeSessionButtonClass = css({ bg: 'accent.default/15!', borderColor: 'accent.default!', boxShadow: '0 0 25px {colors.indigo.500/10}' });

@@ -14,8 +14,11 @@ rain-engine-blob = { path = "../rain-engine-blob" }
 rain-engine-core = { path = "../rain-engine-core" }
 rain-engine-provider-gemini = { path = "../rain-engine-provider-gemini" }
 rain-engine-openai = { path = "../rain-engine-openai" }
+rain-engine-cognition = { path = "../rain-engine-cognition" }
 rain-engine-store-pg = { path = "../rain-engine-store-pg" }
 rain-engine-store-sqlite = { path = "../rain-engine-store-sqlite" }
+rain-engine-wasm = { path = "../rain-engine-wasm" }
+rain-engine-skills = { path = "../rain-engine-skills" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -25,9 +28,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 typeshare.workspace = true
+reqwest = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
 rain-engine-macros = { path = "../rain-engine-macros" }
-rain-engine-wasm = { path = "../rain-engine-wasm" }
 schemars.workspace = true
 tower.workspace = true

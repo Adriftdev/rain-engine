@@ -44,6 +44,12 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<ProviderDecision, ProviderError>;
 }
 
+#[async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    async fn generate_embeddings(&self, texts: Vec<String>)
+    -> Result<Vec<Vec<f32>>, ProviderError>;
+}
+
 type DynamicResponder =
     dyn Fn(ProviderRequest) -> Result<ProviderDecision, ProviderError> + Send + Sync;
 

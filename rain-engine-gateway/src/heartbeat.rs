@@ -61,15 +61,21 @@ impl HeartbeatScheduler {
                         continue;
                     }
 
-                    info!("Heartbeat firing");
-                    match self
-                        .client
-                        .send_human_input(
-                            "heartbeat",
-                            &self.session_id,
-                            "HEARTBEAT: Review pending tasks, check for notifications, and perform any scheduled maintenance.",
-                        )
-                        .await
+                        info!("Heartbeat firing");
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_millis() as i64)
+                            .unwrap_or_default();
+                        let wake_id = format!("heartbeat-{now_ms}");
+                        match self
+                            .client
+                            .send_scheduled_wake(
+                                &self.session_id,
+                                &wake_id,
+                                now_ms,
+                                "Heartbeat: review pending tasks, check notifications, and perform scheduled maintenance.",
+                            )
+                            .await
                     {
                         Ok(result) => {
                             if let Some(response) = &result.outcome.response {

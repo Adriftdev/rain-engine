@@ -3,10 +3,16 @@
 //! This crate composes over `rain-engine-core`; the kernel remains useful
 //! without it.
 
+mod rag;
+mod research_planner;
+
+pub use rag::*;
+pub use research_planner::*;
+
 use async_trait::async_trait;
 use rain_engine_core::{
-    AgentAction, AgentStateSnapshot, AgentTrigger, GoalId, GoalRecord, GoalStatus, KernelEvent,
-    ResumeToken, TaskId, TaskRecord, TaskStatus, WakeId, WakeRequestRecord,
+    AgentStateSnapshot, AgentTrigger, GoalId, GoalRecord, GoalStatus, KernelEvent, Planner,
+    PlannerOutput, ResumeToken, TaskId, TaskRecord, TaskStatus, WakeId, WakeRequestRecord,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,17 +108,6 @@ impl Default for AgentKernelProfile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct PlannerOutput {
-    pub events: Vec<KernelEvent>,
-    pub suggested_action: Option<AgentAction>,
-}
-
-#[async_trait]
-pub trait Planner: Send + Sync {
-    async fn plan(&self, state: &AgentStateSnapshot, trigger: &AgentTrigger) -> PlannerOutput;
-}
-
 #[async_trait]
 pub trait TaskRouter: Send + Sync {
     async fn route(&self, task: &TaskRecord) -> TaskRoute;
@@ -169,9 +164,7 @@ impl Planner for MinimalTaskGraphPlanner {
                         KernelEvent::TaskPlanned(task),
                         KernelEvent::WakeScheduled(wake),
                     ],
-                    suggested_action: Some(AgentAction::Continue {
-                        reason: rain_engine_core::ContinueReason::ModelRequested,
-                    }),
+                    proposed_plan: None,
                 }
             }
             AgentTrigger::SystemObservation { source, .. }
@@ -204,9 +197,7 @@ impl Planner for MinimalTaskGraphPlanner {
                         KernelEvent::TaskPlanned(task),
                         KernelEvent::WakeScheduled(wake),
                     ],
-                    suggested_action: Some(AgentAction::Continue {
-                        reason: rain_engine_core::ContinueReason::ModelRequested,
-                    }),
+                    proposed_plan: None,
                 }
             }
             AgentTrigger::ScheduledWake { .. } => {
@@ -222,22 +213,18 @@ impl Planner for MinimalTaskGraphPlanner {
                             claimed_at: std::time::SystemTime::now(),
                             assignee: Some("scheduler".to_string()),
                         }],
-                        suggested_action: Some(AgentAction::Continue {
-                            reason: rain_engine_core::ContinueReason::ModelRequested,
-                        }),
+                        proposed_plan: None,
                     }
                 } else {
                     PlannerOutput {
                         events: Vec::new(),
-                        suggested_action: Some(AgentAction::Yield {
-                            reason: Some("no waiting tasks to resume".to_string()),
-                        }),
+                        proposed_plan: None,
                     }
                 }
             }
             _ => PlannerOutput {
                 events: Vec::new(),
-                suggested_action: None,
+                proposed_plan: None,
             },
         }
     }

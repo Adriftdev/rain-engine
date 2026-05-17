@@ -42,7 +42,9 @@ fn main() {
                 "You are a customer support automation agent with access to trusted backend tools."
                     .to_string(),
             provider_name: "gemini".to_string(),
+            embedding_model: "text-embedding-004".to_string(),
         },
+        enable_research_planner: true,
     };
 
     let ingress = ValkeyStreamConfig {

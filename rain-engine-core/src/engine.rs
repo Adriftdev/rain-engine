@@ -1,17 +1,18 @@
 use crate::{
-    AdvanceRequest, AdvanceResult, AgentAction, AgentContext, AgentStateDelta, AgentTrigger,
-    ApprovalDecision, ApprovalResolutionRecord, ContinueRequest, DelegationRecord,
-    DeliberationOutcome, DeliberationRecord, EngineOutcome, ExecutionMetadata, KernelEvent,
-    KernelEventRecord, LlmProvider, MemoryError, MemoryStore, MemoryStoreExt, ModelDecisionRecord,
-    OutcomeRecord, PendingApprovalRecord, PlannedSkillCall, PolicyOverlay, PolicyOverlayPatch,
+    AdvanceRequest, AdvanceResult, AgentAction, AgentContext, AgentContextSnapshot,
+    AgentStateDelta, AgentTrigger, ApprovalDecision, ApprovalResolutionRecord, ContinueRequest,
+    DelegationRecord, DeliberationOutcome, DeliberationRecord, EngineOutcome, EnginePolicy,
+    ExecutionMetadata, ExecutionPlanRecord, KernelEvent, KernelEventRecord, LlmProvider,
+    MemoryError, MemoryStore, MemoryStoreExt, ModelDecisionRecord, OutcomeRecord,
+    PendingApprovalRecord, PlannedSkillCall, Planner, PolicyOverlay, PolicyOverlayPatch,
     PolicyOverlayStatus, PolicyTuningAction, PolicyTuningRecord, ProcessRequest,
     ProfilePatchRecord, ProviderContentPart, ProviderDecision, ProviderMessage, ProviderRequest,
-    ProviderRole, ReflectionRecord, ResumeToken, SelfImprovementMode, SessionRecord,
-    SessionSnapshot, SkillBackendKind, SkillDefinition, SkillFailure, SkillFailureKind,
-    SkillInputValidationRecord, SkillInvocation, SkillManifest, StopReason,
-    StrategyPreferenceRecord, SuspendReason, ToolCallRecord, ToolDependency, ToolExecutionGraph,
-    ToolNode, ToolNodeCheckpointRecord, ToolNodeStatus, ToolPerformanceRecord, ToolResultRecord,
-    TriggerRecord, WakeRequestRecord,
+    ProviderRequestConfig, ProviderRole, ReflectionRecord, ResumeToken, RetryPolicy,
+    SelfImprovementMode, SessionRecord, SessionSnapshot, SkillBackendKind, SkillDefinition,
+    SkillFailure, SkillFailureKind, SkillInputValidationRecord, SkillInvocation, SkillManifest,
+    SkillStore, StopReason, StrategyPreferenceRecord, SummaryRecord, SuspendReason, ToolCallRecord,
+    ToolDependency, ToolExecutionGraph, ToolNode, ToolNodeCheckpointRecord, ToolNodeStatus,
+    ToolPerformanceRecord, ToolResultRecord, TriggerIntentRecord, TriggerRecord, WakeRequestRecord,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -30,6 +31,8 @@ pub enum EngineError {
     Memory(#[from] MemoryError),
     #[error("blob error: {0}")]
     Blob(String),
+    #[error("provider error: {0}")]
+    Provider(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,7 @@ pub enum EngineErrorKind {
     Storage,
     Blob,
     Join,
+    Provider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +54,7 @@ impl EngineError {
         match self {
             EngineError::Memory(_) => EngineErrorKind::Storage,
             EngineError::Blob(_) => EngineErrorKind::Blob,
+            EngineError::Provider(_) => EngineErrorKind::Provider,
         }
     }
 
@@ -57,6 +62,7 @@ impl EngineError {
         match self {
             EngineError::Memory(_) => EngineErrorSeverity::Fatal,
             EngineError::Blob(_) => EngineErrorSeverity::Recoverable,
+            EngineError::Provider(_) => EngineErrorSeverity::Recoverable,
         }
     }
 
@@ -112,7 +118,7 @@ pub trait NativeSkill: Send + Sync {
 }
 
 #[derive(Clone)]
-enum RegisteredSkillBackend {
+pub(crate) enum RegisteredSkillBackend {
     Wasm(Arc<dyn SkillExecutor>),
     Native(Arc<dyn NativeSkill>),
 }
@@ -141,9 +147,9 @@ impl RegisteredSkillBackend {
 }
 
 #[derive(Clone)]
-struct RegisteredSkill {
-    manifest: SkillManifest,
-    backend: RegisteredSkillBackend,
+pub(crate) struct RegisteredSkill {
+    pub(crate) manifest: SkillManifest,
+    pub(crate) backend: RegisteredSkillBackend,
 }
 
 impl RegisteredSkill {
@@ -159,7 +165,9 @@ impl RegisteredSkill {
 pub struct AgentEngine {
     llm: Arc<dyn LlmProvider>,
     memory: Arc<dyn MemoryStore>,
+    skill_store: Option<Arc<dyn SkillStore>>,
     skills: Arc<DashMap<String, RegisteredSkill>>,
+    planner: Option<Arc<dyn Planner>>,
 }
 
 impl AgentEngine {
@@ -167,26 +175,33 @@ impl AgentEngine {
         Self {
             llm,
             memory,
+            skill_store: None,
             skills: Arc::new(DashMap::new()),
+            planner: None,
         }
     }
 
-    pub async fn advance(&self, request: AdvanceRequest) -> Result<AdvanceResult, EngineError> {
-        match request {
-            AdvanceRequest::Trigger(request) => self.advance_trigger(request).await,
-            AdvanceRequest::Continue(request) => self.advance_continue(request).await,
-        }
+    pub fn with_skill_store(mut self, skill_store: Arc<dyn SkillStore>) -> Self {
+        self.skill_store = Some(skill_store);
+        self
     }
 
-    pub async fn register_skill(&self, manifest: SkillManifest, executor: Arc<dyn SkillExecutor>) {
-        self.register_wasm_skill(manifest, executor).await;
+    pub fn with_planner(mut self, planner: Arc<dyn Planner>) -> Self {
+        self.planner = Some(planner);
+        self
     }
 
-    pub async fn register_wasm_skill(
-        &self,
-        manifest: SkillManifest,
-        executor: Arc<dyn SkillExecutor>,
-    ) {
+    pub fn register_native_skill(&self, manifest: SkillManifest, skill: Arc<dyn NativeSkill>) {
+        self.skills.insert(
+            manifest.name.clone(),
+            RegisteredSkill {
+                manifest,
+                backend: RegisteredSkillBackend::Native(skill),
+            },
+        );
+    }
+
+    pub fn register_wasm_skill(&self, manifest: SkillManifest, executor: Arc<dyn SkillExecutor>) {
         self.skills.insert(
             manifest.name.clone(),
             RegisteredSkill {
@@ -196,18 +211,24 @@ impl AgentEngine {
         );
     }
 
-    pub async fn register_native_skill(
+    pub async fn register_wasm_skill_persistent(
         &self,
         manifest: SkillManifest,
-        executor: Arc<dyn NativeSkill>,
-    ) {
-        self.skills.insert(
-            manifest.name.clone(),
-            RegisteredSkill {
-                manifest,
-                backend: RegisteredSkillBackend::Native(executor),
-            },
-        );
+        executor: Arc<dyn SkillExecutor>,
+        wasm_bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        if let Some(store) = &self.skill_store {
+            store.store_skill(manifest.clone(), wasm_bytes).await?;
+        }
+        self.register_wasm_skill(manifest, executor);
+        Ok(())
+    }
+
+    pub async fn advance(&self, request: AdvanceRequest) -> Result<AdvanceResult, EngineError> {
+        match request {
+            AdvanceRequest::Trigger(request) => self.advance_trigger(request).await,
+            AdvanceRequest::Continue(request) => self.advance_continue(request).await,
+        }
     }
 
     pub async fn skill_definitions(&self) -> Vec<SkillDefinition> {
@@ -246,6 +267,7 @@ impl AgentEngine {
             idempotency_key: request.idempotency_key.clone(),
             recorded_at: started_at,
             trigger: request.trigger.clone(),
+            intent: None,
         };
         if let Err(err) = self.memory.append_trigger(trigger_record).await {
             return Ok(AdvanceResult {
@@ -256,7 +278,7 @@ impl AgentEngine {
             });
         }
 
-        let snapshot = match self.memory.load_session(&request.session_id).await {
+        let mut snapshot = match self.memory.load_session(&request.session_id).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 return Ok(AdvanceResult {
@@ -267,6 +289,91 @@ impl AgentEngine {
                 });
             }
         };
+        counter!("rain_engine.triggers_total").increment(1);
+
+        // Intent is classified deterministically so one advance step still asks
+        // the provider at most once.
+        let _ = self
+            .memory
+            .append_trigger_intent(
+                &request.session_id,
+                TriggerIntentRecord {
+                    trigger_id: trigger_id.clone(),
+                    classified_at: SystemTime::now(),
+                    intent: classify_trigger_intent(&request.trigger),
+                },
+            )
+            .await;
+        if let Ok(refreshed) = self.memory.load_session(&request.session_id).await {
+            snapshot = refreshed;
+        }
+
+        // Invoke planner if available to handle goal decomposition or task adjustment
+        if let Some(planner) = &self.planner {
+            let output = planner
+                .plan(&snapshot.agent_state(), &request.trigger)
+                .await;
+            let mut changed = false;
+            if !output.events.is_empty() {
+                for event in output.events {
+                    let _ = self
+                        .memory
+                        .append_kernel_event(
+                            &request.session_id,
+                            KernelEventRecord {
+                                event_id: Uuid::new_v4().to_string(),
+                                occurred_at: SystemTime::now(),
+                                event,
+                            },
+                        )
+                        .await;
+                }
+                changed = true;
+            }
+            if let Some(plan) = output.proposed_plan {
+                let _ = self
+                    .memory
+                    .append_execution_plan(
+                        &request.session_id,
+                        ExecutionPlanRecord {
+                            plan_id: format!("plan-{}", Uuid::new_v4()),
+                            created_at: SystemTime::now(),
+                            objective: plan.objective,
+                            steps: plan.steps,
+                            current_step_index: 0,
+                            completed_at: None,
+                        },
+                    )
+                    .await;
+                changed = true;
+            }
+            if changed {
+                // Refresh snapshot if planning occurred
+                if let Ok(refreshed) = self.memory.load_session(&request.session_id).await {
+                    snapshot = refreshed;
+                }
+            }
+
+            // Trigger history summarization if history is getting long
+            if snapshot.records.len() > 10
+                && !snapshot
+                    .records
+                    .iter()
+                    .any(|r| matches!(r, SessionRecord::Summary(_)))
+                && let Ok(summary) = self
+                    .summarize_history(&snapshot, &request.policy, &request.trigger)
+                    .await
+            {
+                let _ = self
+                    .memory
+                    .append_summary(&request.session_id, summary)
+                    .await;
+                // Refresh snapshot again to include summary
+                if let Ok(refreshed) = self.memory.load_session(&request.session_id).await {
+                    snapshot = refreshed;
+                }
+            }
+        }
         let effective_policy = request
             .policy
             .clone()
@@ -541,8 +648,32 @@ impl AgentEngine {
         trigger: AgentTrigger,
         steps_executed: usize,
         consecutive_tool_failure_steps: usize,
-        mut emitted_events: Vec<KernelEventRecord>,
+        emitted_events: Vec<KernelEventRecord>,
     ) -> Result<AdvanceResult, EngineError> {
+        if let Some(mut plan) = context.active_execution_plan()
+            && plan.current_step_index < plan.steps.len()
+        {
+            let action = plan.steps[plan.current_step_index].clone();
+            plan.current_step_index += 1;
+            if plan.current_step_index >= plan.steps.len() {
+                plan.completed_at = Some(SystemTime::now());
+            }
+            let _ = self
+                .memory
+                .append_execution_plan(&context.session_id, plan)
+                .await;
+
+            return self
+                .execute_action(
+                    context,
+                    action,
+                    steps_executed,
+                    consecutive_tool_failure_steps,
+                    emitted_events,
+                )
+                .await;
+        }
+
         if let Some(outcome) = self
             .policy_outcome(&mut context, steps_executed, consecutive_tool_failure_steps)
             .await?
@@ -641,7 +772,25 @@ impl AgentEngine {
             .records
             .push(SessionRecord::ModelDecision(decision_record));
 
-        match decision.action {
+        self.execute_action(
+            context,
+            decision.action,
+            steps_executed,
+            consecutive_tool_failure_steps,
+            emitted_events,
+        )
+        .await
+    }
+
+    async fn execute_action(
+        &self,
+        mut context: AgentContext,
+        action: AgentAction,
+        steps_executed: usize,
+        _consecutive_tool_failure_steps: usize,
+        mut emitted_events: Vec<KernelEventRecord>,
+    ) -> Result<AdvanceResult, EngineError> {
+        match action {
             AgentAction::Plan {
                 summary,
                 candidate_actions,
@@ -1192,7 +1341,7 @@ impl AgentEngine {
             });
             if let Some(blocked_by) = blocked_by {
                 let message = format!("dependency `{}` did not succeed", blocked_by.call_id);
-                let result = error_result(
+                let result = self.error_result(
                     node.call_id.clone(),
                     node.skill_name.clone(),
                     SkillFailureKind::Internal,
@@ -1247,7 +1396,7 @@ impl AgentEngine {
                 Some(format!("skill `{}` is not registered", node.skill_name)),
             )
             .await?;
-            return Ok(PreparedNode::Immediate(error_result(
+            return Ok(PreparedNode::Immediate(self.error_result(
                 node.call_id.clone(),
                 node.skill_name.clone(),
                 SkillFailureKind::Internal,
@@ -1270,7 +1419,7 @@ impl AgentEngine {
                     Some(message.clone()),
                 )
                 .await?;
-                return Ok(PreparedNode::Immediate(error_result(
+                return Ok(PreparedNode::Immediate(self.error_result(
                     node.call_id.clone(),
                     node.skill_name.clone(),
                     SkillFailureKind::InvalidArguments,
@@ -1300,7 +1449,7 @@ impl AgentEngine {
                 )),
             )
             .await?;
-            return Ok(PreparedNode::Immediate(error_result(
+            return Ok(PreparedNode::Immediate(self.error_result(
                 node.call_id.clone(),
                 node.skill_name.clone(),
                 SkillFailureKind::PermissionDenied,
@@ -1320,7 +1469,7 @@ impl AgentEngine {
                 Some("native skills are disabled by policy".to_string()),
             )
             .await?;
-            return Ok(PreparedNode::Immediate(error_result(
+            return Ok(PreparedNode::Immediate(self.error_result(
                 node.call_id.clone(),
                 node.skill_name.clone(),
                 SkillFailureKind::PermissionDenied,
@@ -1343,11 +1492,34 @@ impl AgentEngine {
                 Some("dry-run execution is not enabled for this skill".to_string()),
             )
             .await?;
-            return Ok(PreparedNode::Immediate(error_result(
+            return Ok(PreparedNode::Immediate(self.error_result(
                 node.call_id.clone(),
                 node.skill_name.clone(),
                 SkillFailureKind::CapabilityDenied,
                 "dry-run execution is not enabled for this skill".to_string(),
+            )));
+        }
+
+        if self.is_skill_circuit_broken(&node.skill_name, context) {
+            counter!("rain_engine.circuit_breaker_trips_total", "skill" => node.skill_name.clone())
+                .increment(1);
+            self.append_tool_checkpoint(
+                context,
+                graph,
+                node,
+                ToolNodeStatus::Failed,
+                0,
+                Some(format!(
+                    "circuit breaker tripped for skill `{}`",
+                    node.skill_name
+                )),
+            )
+            .await?;
+            return Ok(PreparedNode::Immediate(self.error_result(
+                node.call_id.clone(),
+                node.skill_name.clone(),
+                SkillFailureKind::CapabilityDenied,
+                format!("circuit breaker tripped for skill `{}`", node.skill_name),
             )));
         }
 
@@ -1381,11 +1553,12 @@ impl AgentEngine {
         )
         .increment(1);
 
-        let call_retry_limit = node
-            .retry_policy
-            .max_retries
-            .min(manifest.resource_policy.max_retries)
+        let mut retry_policy = node.retry_policy.policy.clone();
+        retry_policy.max_attempts = retry_policy
+            .max_attempts
+            .min(manifest.resource_policy.retry_policy.max_attempts)
             .min(context.metadata.policy.max_tool_retries_per_step);
+
         Ok(PreparedNode::Executable(Box::new(PreparedCall {
             call_id: node.call_id.clone(),
             name: node.skill_name.clone(),
@@ -1394,12 +1567,7 @@ impl AgentEngine {
             backend: skill.backend.clone(),
             context_snapshot: context.to_snapshot(step),
             dry_run: node.dry_run,
-            max_retries: call_retry_limit,
-            retry_backoff_ms: node
-                .retry_policy
-                .retry_backoff_ms
-                .max(1)
-                .min(skill.manifest.resource_policy.retry_backoff_ms.max(1)),
+            retry_policy,
         })))
     }
 
@@ -1460,7 +1628,11 @@ impl AgentEngine {
         context
             .records
             .push(SessionRecord::Outcome(outcome.clone()));
-        self.run_self_improvement(context, &outcome).await?;
+        let session_id = context.session_id.clone();
+        let snapshot = context.to_snapshot(steps_executed);
+        let outcome_clone = outcome.clone();
+        self.run_self_improvement(session_id, snapshot, outcome_clone)
+            .await?;
         Ok(EngineOutcome {
             trigger_id: outcome.trigger_id,
             stop_reason,
@@ -1473,30 +1645,31 @@ impl AgentEngine {
     }
 
     #[instrument(
-        skip(self, context, outcome),
+        skip(self, snapshot, outcome),
         fields(
-            session_id = %context.session_id,
-            trigger_id = %context.metadata.trigger_id,
+            session_id = %session_id,
+            trigger_id = %snapshot.trigger_id,
             stop_reason = ?outcome.stop_reason
         )
     )]
     async fn run_self_improvement(
         &self,
-        context: &mut AgentContext,
-        outcome: &OutcomeRecord,
+        session_id: String,
+        snapshot: AgentContextSnapshot,
+        outcome: OutcomeRecord,
     ) -> Result<(), EngineError> {
-        let policy = context.metadata.policy.self_improvement.clone();
+        let policy = snapshot.policy.self_improvement.clone();
         if !policy.enabled {
             return Ok(());
         }
 
         counter!("rain_engine.self_improvement_reflections_total").increment(1);
 
-        let observations = reflection_observations(context, outcome);
+        let observations = reflection_observations(&snapshot, &outcome);
         let reflection = ReflectionRecord {
             reflection_id: format!("reflection-{}", Uuid::new_v4()),
             created_at: SystemTime::now(),
-            trigger_id: context.metadata.trigger_id.clone(),
+            trigger_id: snapshot.trigger_id.clone(),
             summary: format!(
                 "Observed {:?} after {} step(s); evaluating future policy and strategy.",
                 outcome.stop_reason, outcome.steps_executed
@@ -1505,17 +1678,13 @@ impl AgentEngine {
             confidence: 0.72,
         };
         self.memory
-            .append_reflection(&context.session_id, reflection.clone())
+            .append_reflection(&session_id, reflection.clone())
             .await?;
-        context.records.push(SessionRecord::Reflection(reflection));
 
-        for performance in summarize_tool_performance(&context.records) {
+        for performance in summarize_tool_performance(&snapshot.history) {
             self.memory
-                .append_tool_performance(&context.session_id, performance.clone())
+                .append_tool_performance(&session_id, performance.clone())
                 .await?;
-            context
-                .records
-                .push(SessionRecord::ToolPerformance(performance.clone()));
             if performance.calls > 0 {
                 counter!(
                     "rain_engine.tool_performance_summaries_total",
@@ -1537,28 +1706,24 @@ impl AgentEngine {
                     confidence: 0.68,
                 };
                 self.memory
-                    .append_strategy_preference(&context.session_id, preference.clone())
+                    .append_strategy_preference(&session_id, preference)
                     .await?;
-                context
-                    .records
-                    .push(SessionRecord::StrategyPreference(preference));
             }
         }
 
-        if terminal_observation_count(&context.records) < policy.min_observations_before_tuning {
+        if terminal_observation_count(&snapshot.history) < policy.min_observations_before_tuning {
             return Ok(());
         }
 
-        if let Some(rollback) = maybe_rollback_regression(context, outcome) {
+        if let Some(rollback) = maybe_rollback_regression(&snapshot, &outcome) {
             self.memory
-                .append_policy_tuning(&context.session_id, rollback.clone())
+                .append_policy_tuning(&session_id, rollback)
                 .await?;
-            context.records.push(SessionRecord::PolicyTuning(rollback));
             counter!("rain_engine.self_improvement_rollbacks_total").increment(1);
             return Ok(());
         }
 
-        let Some(tuning) = propose_policy_tuning(context, outcome) else {
+        let Some(tuning) = propose_policy_tuning(&snapshot, &outcome) else {
             return Ok(());
         };
         match tuning.action {
@@ -1571,9 +1736,8 @@ impl AgentEngine {
             PolicyTuningAction::Proposed | PolicyTuningAction::RolledBack => {}
         }
         self.memory
-            .append_policy_tuning(&context.session_id, tuning.clone())
+            .append_policy_tuning(&session_id, tuning)
             .await?;
-        context.records.push(SessionRecord::PolicyTuning(tuning));
 
         let profile_patch = ProfilePatchRecord {
             patch_id: format!("profile-patch-{}", Uuid::new_v4()),
@@ -1584,13 +1748,137 @@ impl AgentEngine {
             applied: true,
         };
         self.memory
-            .append_profile_patch(&context.session_id, profile_patch.clone())
+            .append_profile_patch(&session_id, profile_patch)
             .await?;
-        context
-            .records
-            .push(SessionRecord::ProfilePatch(profile_patch));
 
         Ok(())
+    }
+
+    fn is_skill_circuit_broken(&self, skill_name: &str, context: &AgentContext) -> bool {
+        let performance = summarize_tool_performance(&context.records);
+        if let Some(perf) = performance.into_iter().find(|p| p.skill_name == skill_name)
+            && perf.calls >= 3
+        {
+            let threshold = self
+                .skills
+                .get(skill_name)
+                .map(|s| s.value().definition().manifest.circuit_breaker_threshold)
+                .unwrap_or(0.5);
+            return perf.failure_rate >= threshold;
+        }
+        false
+    }
+
+    fn error_result(
+        &self,
+        call_id: String,
+        skill_name: String,
+        kind: SkillFailureKind,
+        message: String,
+    ) -> ToolResultRecord {
+        ToolResultRecord {
+            call_id,
+            finished_at: SystemTime::now(),
+            skill_name,
+            output: Err(SkillFailure { kind, message }),
+        }
+    }
+
+    async fn summarize_history(
+        &self,
+        snapshot: &SessionSnapshot,
+        policy: &EnginePolicy,
+        trigger: &AgentTrigger,
+    ) -> Result<SummaryRecord, EngineError> {
+        let history_text = snapshot
+            .records
+            .iter()
+            .map(|r| format!("{:?}", r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "Summarize the following conversation history concisely while preserving all key decisions, facts, and outcomes:\n\n{}",
+            history_text
+        );
+
+        let context = AgentContextSnapshot {
+            session_id: snapshot.session_id.clone(),
+            granted_scopes: Vec::new(),
+            trigger_id: "internal".to_string(),
+            idempotency_key: None,
+            current_step: 0,
+            max_steps: 0,
+            history: snapshot.records.clone(),
+            prior_tool_results: snapshot.tool_results(),
+            session_cost_usd: 0.0,
+            state: snapshot.agent_state(),
+            policy: policy.clone(),
+            active_execution_plan: snapshot.active_execution_plan(),
+        };
+
+        let request = ProviderRequest {
+            trigger: trigger.clone(),
+            context,
+            available_skills: self.skill_definitions().await,
+            config: ProviderRequestConfig {
+                model: None,
+                temperature: Some(0.0),
+                max_tokens: Some(500),
+            },
+            policy: policy.clone(),
+            contents: vec![ProviderMessage {
+                role: ProviderRole::User,
+                parts: vec![ProviderContentPart::Text(prompt)],
+            }],
+        };
+
+        let decision = self
+            .llm
+            .generate_action(request)
+            .await
+            .map_err(|e| EngineError::Provider(e.to_string()))?;
+
+        if let AgentAction::Respond { content } = decision.action {
+            Ok(SummaryRecord {
+                summary_id: format!("summary-{}", Uuid::new_v4()),
+                created_at: SystemTime::now(),
+                content,
+                original_sequence_range: (0, snapshot.records.len()),
+            })
+        } else {
+            Err(EngineError::Provider(
+                "Failed to generate summary".to_string(),
+            ))
+        }
+    }
+}
+
+fn classify_trigger_intent(trigger: &AgentTrigger) -> String {
+    match trigger {
+        AgentTrigger::ExternalEvent { source, .. } => format!("external_event:{source}"),
+        AgentTrigger::ScheduledWake { .. } => "scheduled_wake".to_string(),
+        AgentTrigger::HumanInput { content, .. } | AgentTrigger::Message { content, .. } => {
+            let lowered = content.to_lowercase();
+            if lowered.contains("approve") || lowered.contains("permission") {
+                "approval_or_permission".to_string()
+            } else if lowered.contains("fix")
+                || lowered.contains("change")
+                || lowered.contains("write")
+            {
+                "task_execution".to_string()
+            } else if lowered.contains("what") || lowered.contains("why") || lowered.contains("how")
+            {
+                "question_answering".to_string()
+            } else {
+                "conversation".to_string()
+            }
+        }
+        AgentTrigger::SystemObservation { source, .. } => format!("system_observation:{source}"),
+        AgentTrigger::Webhook { source, .. } => format!("webhook:{source}"),
+        AgentTrigger::RuleTrigger { rule_id, .. } => format!("rule:{rule_id}"),
+        AgentTrigger::ProactiveHeartbeat { .. } => "heartbeat".to_string(),
+        AgentTrigger::Approval { decision, .. } => format!("approval:{decision:?}"),
+        AgentTrigger::DelegationResult { .. } => "delegation_result".to_string(),
     }
 }
 
@@ -1606,28 +1894,24 @@ fn action_metric_label(action: &AgentAction) -> &'static str {
     }
 }
 
-fn reflection_observations(context: &AgentContext, outcome: &OutcomeRecord) -> Vec<String> {
-    let tool_results = context
-        .records
+fn reflection_observations(
+    snapshot: &AgentContextSnapshot,
+    outcome: &OutcomeRecord,
+) -> Vec<String> {
+    let tool_results = snapshot
+        .history
         .iter()
         .filter(|record| matches!(record, SessionRecord::ToolResult(_)))
         .count();
-    let failed_tools = context
-        .records
+    let failed_tools = snapshot
+        .history
         .iter()
         .filter(|record| match record {
             SessionRecord::ToolResult(result) => result.output.is_err(),
             _ => false,
         })
         .count();
-    let provider_cost = context
-        .records
-        .iter()
-        .filter_map(|record| match record {
-            SessionRecord::ProviderUsage(usage) => Some(usage.estimated_cost_usd),
-            _ => None,
-        })
-        .sum::<f64>();
+    let provider_cost = snapshot.session_cost_usd;
 
     vec![
         format!("terminal_stop_reason={:?}", outcome.stop_reason),
@@ -1696,15 +1980,10 @@ fn terminal_observation_count(records: &[SessionRecord]) -> usize {
 }
 
 fn maybe_rollback_regression(
-    context: &AgentContext,
+    snapshot: &AgentContextSnapshot,
     outcome: &OutcomeRecord,
 ) -> Option<PolicyTuningRecord> {
-    if !context
-        .metadata
-        .policy
-        .self_improvement
-        .rollback_on_regression
-    {
+    if !snapshot.policy.self_improvement.rollback_on_regression {
         return None;
     }
     if !matches!(
@@ -1717,15 +1996,15 @@ fn maybe_rollback_regression(
         return None;
     }
     let active = SessionSnapshot {
-        session_id: context.session_id.clone(),
-        records: context.records.clone(),
+        session_id: snapshot.session_id.clone(),
+        records: snapshot.history.clone(),
         last_sequence_no: None,
         latest_outcome: Some(outcome.clone()),
     }
     .active_policy_overlay()?;
 
-    let mut projected_policy = context.metadata.policy.clone();
-    projected_policy.self_improvement = context.metadata.policy.self_improvement.clone();
+    let mut projected_policy = snapshot.policy.clone();
+    projected_policy.self_improvement = snapshot.policy.self_improvement.clone();
     Some(PolicyTuningRecord {
         tuning_id: format!("tuning-{}", Uuid::new_v4()),
         created_at: SystemTime::now(),
@@ -1738,16 +2017,16 @@ fn maybe_rollback_regression(
             ..active
         },
         action: PolicyTuningAction::RolledBack,
-        prior_policy: context.metadata.policy.clone(),
+        prior_policy: snapshot.policy.clone(),
         projected_policy,
     })
 }
 
 fn propose_policy_tuning(
-    context: &AgentContext,
+    snapshot: &AgentContextSnapshot,
     outcome: &OutcomeRecord,
 ) -> Option<PolicyTuningRecord> {
-    let improvement = &context.metadata.policy.self_improvement;
+    let improvement = &snapshot.policy.self_improvement;
     let mut patch = PolicyOverlayPatch::default();
     let mut reason = None::<String>;
     let delta = improvement.max_policy_delta_percent.clamp(1.0, 100.0);
@@ -1761,7 +2040,7 @@ fn propose_policy_tuning(
                 .unwrap_or(false) =>
         {
             patch.provider_timeout_ms = Some(increase_by_percent(
-                context.metadata.policy.provider_timeout_ms,
+                snapshot.policy.provider_timeout_ms,
                 delta,
             ));
             reason = Some(
@@ -1769,10 +2048,7 @@ fn propose_policy_tuning(
             );
         }
         StopReason::MaxStepsReached => {
-            patch.max_steps = Some(increase_usize_by_percent(
-                context.metadata.policy.max_steps,
-                delta,
-            ));
+            patch.max_steps = Some(increase_usize_by_percent(snapshot.policy.max_steps, delta));
             reason = Some(
                 "Session hit max steps; increasing future step budget within guardrails."
                     .to_string(),
@@ -1780,7 +2056,7 @@ fn propose_policy_tuning(
         }
         StopReason::DeadlineExceeded => {
             patch.max_execution_time_ms = Some(increase_by_percent(
-                context.metadata.policy.max_execution_time_ms,
+                snapshot.policy.max_execution_time_ms,
                 delta,
             ));
             reason = Some("Execution deadline was reached; increasing future wall-clock budget within guardrails.".to_string());
@@ -1808,7 +2084,7 @@ fn propose_policy_tuning(
             SelfImprovementMode::AutoWithGuardrails => PolicyOverlayStatus::Applied,
         },
         reason,
-        evidence_window_records: context.records.len(),
+        evidence_window_records: snapshot.history.len(),
         patch,
         confidence: 0.74,
         rollback_condition:
@@ -1831,7 +2107,7 @@ fn propose_policy_tuning(
         }
     };
 
-    let mut projected_policy = context.metadata.policy.clone();
+    let mut projected_policy = snapshot.policy.clone();
     overlay.apply_to(&mut projected_policy);
 
     Some(PolicyTuningRecord {
@@ -1839,7 +2115,7 @@ fn propose_policy_tuning(
         created_at: SystemTime::now(),
         overlay,
         action,
-        prior_policy: context.metadata.policy.clone(),
+        prior_policy: snapshot.policy.clone(),
         projected_policy,
     })
 }
@@ -2055,8 +2331,7 @@ struct PreparedCall {
     backend: RegisteredSkillBackend,
     context_snapshot: crate::AgentContextSnapshot,
     dry_run: bool,
-    max_retries: usize,
-    retry_backoff_ms: u64,
+    retry_policy: RetryPolicy,
 }
 
 enum PreparedNode {
@@ -2086,8 +2361,8 @@ async fn run_prepared_call(prepared: PreparedCall) -> Result<ToolResultRecord, E
         SkillFailureKind::Internal,
         "tool was not attempted",
     ));
-    let attempts = prepared.max_retries + 1;
-    for attempt in 0..attempts {
+    let mut current_interval_ms = prepared.retry_policy.initial_interval_ms;
+    for attempt in 0..prepared.retry_policy.max_attempts {
         let invocation = SkillInvocation {
             call_id: prepared.call_id.clone(),
             manifest: prepared.manifest.clone(),
@@ -2099,10 +2374,16 @@ async fn run_prepared_call(prepared: PreparedCall) -> Result<ToolResultRecord, E
             RegisteredSkillBackend::Wasm(executor) => executor.execute(invocation).await,
             RegisteredSkillBackend::Native(executor) => executor.execute(invocation).await,
         };
-        if output.is_ok() || !is_retryable_skill_error(&output) || attempt + 1 >= attempts {
+        if output.is_ok()
+            || !is_retryable_skill_error(&output)
+            || attempt + 1 >= prepared.retry_policy.max_attempts
+        {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(prepared.retry_backoff_ms)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(current_interval_ms)).await;
+        current_interval_ms =
+            ((current_interval_ms as f64) * prepared.retry_policy.backoff_multiplier) as u64;
+        current_interval_ms = current_interval_ms.min(prepared.retry_policy.max_interval_ms);
     }
     histogram!("rain_engine.tool_latency_seconds").record(started.elapsed().as_secs_f64());
 
@@ -2146,20 +2427,6 @@ fn is_retryable_skill_error(output: &Result<serde_json::Value, SkillExecutionErr
             ..
         })
     )
-}
-
-fn error_result(
-    call_id: String,
-    skill_name: String,
-    kind: SkillFailureKind,
-    message: String,
-) -> ToolResultRecord {
-    ToolResultRecord {
-        call_id,
-        finished_at: SystemTime::now(),
-        skill_name,
-        output: Err(SkillFailure { kind, message }),
-    }
 }
 
 fn build_advance_result(
@@ -2217,6 +2484,7 @@ fn derive_state_delta(events: &[KernelEventRecord]) -> AgentStateDelta {
                 .push(correlation_id.clone()),
             KernelEvent::WakeRequested(_)
             | KernelEvent::WakeScheduled(_)
+            | KernelEvent::WakeCompleted { .. }
             | KernelEvent::ResourceRegistered(_)
             | KernelEvent::RelationshipObserved(_) => {}
         }
@@ -2314,19 +2582,15 @@ fn derive_trigger_kernel_events(
             Vec::new(),
         ),
         AgentTrigger::ScheduledWake {
-            wake_id,
-            due_at,
-            reason,
+            wake_id, reason, ..
         } => events.push(KernelEventRecord {
-            event_id: format!("wake-{trigger_id}"),
+            event_id: format!("wake-completed-{trigger_id}"),
             occurred_at: observed_at,
-            event: KernelEvent::WakeRequested(WakeRequestRecord {
+            event: KernelEvent::WakeCompleted {
                 wake_id: wake_id.clone(),
-                requested_at: observed_at,
-                due_at: *due_at,
                 reason: reason.clone(),
-                task_id: None,
-            }),
+                completed_at: observed_at,
+            },
         }),
         AgentTrigger::Message {
             user_id,
@@ -2365,14 +2629,47 @@ fn build_provider_contents(
     history: &[SessionRecord],
 ) -> Vec<ProviderMessage> {
     let mut messages = Vec::new();
+    let mut intent_by_trigger = HashMap::<String, String>::new();
+    for record in history {
+        match record {
+            SessionRecord::Trigger(trigger) => {
+                if let Some(intent) = &trigger.intent {
+                    intent_by_trigger.insert(trigger.trigger_id.clone(), intent.clone());
+                }
+            }
+            SessionRecord::TriggerIntent(intent) => {
+                intent_by_trigger.insert(intent.trigger_id.clone(), intent.intent.clone());
+            }
+            _ => {}
+        }
+    }
 
     // Map history to messages to provide multi-turn memory
     for record in history {
         match record {
             SessionRecord::Trigger(t) => {
+                let mut parts = build_trigger_parts(&t.trigger);
+                if let Some(intent) = t
+                    .intent
+                    .as_ref()
+                    .or_else(|| intent_by_trigger.get(&t.trigger_id))
+                {
+                    parts.push(ProviderContentPart::Text(format!(
+                        "Classified intent: {intent}"
+                    )));
+                }
                 messages.push(ProviderMessage {
                     role: ProviderRole::User,
-                    parts: build_trigger_parts(&t.trigger),
+                    parts,
+                });
+            }
+            SessionRecord::Summary(s) => {
+                messages.push(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    parts: vec![ProviderContentPart::Text(format!(
+                        "Summary of prior history: {}",
+                        s.content
+                    ))],
                 });
             }
             SessionRecord::ModelDecision(d) => match &d.action {
@@ -2585,7 +2882,7 @@ mod tests {
         AttachmentRef, EnginePolicy, InMemoryMemoryStore, MockLlmProvider, ProviderCacheRecord,
         ProviderDecision, ProviderError, ProviderErrorKind, ProviderUsageRecord, RecordPageQuery,
         ResourcePolicy, SessionListQuery, SessionSnapshot, SkillCapability, StopReason, TaskId,
-        TaskRecord, TaskStatus,
+        TaskRecord, TaskStatus, WakeId, WakeRequestRecord,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -2643,6 +2940,7 @@ mod tests {
             capability_grants: vec![SkillCapability::StructuredLog],
             resource_policy: ResourcePolicy::default_for_tools(),
             approval_required: false,
+            circuit_breaker_threshold: 0.5,
         }
     }
 
@@ -2746,15 +3044,13 @@ mod tests {
             },
         ]));
         let engine = AgentEngine::new(llm, store.clone());
-        engine
-            .register_wasm_skill(
-                manifest("echo", &["tool:run"]),
-                Arc::new(StubSkillExecutor {
-                    name: "stub",
-                    responder: Arc::new(|invocation| Ok(json!({"echo": invocation.args}))),
-                }),
-            )
-            .await;
+        engine.register_wasm_skill(
+            manifest("echo", &["tool:run"]),
+            Arc::new(StubSkillExecutor {
+                name: "stub",
+                responder: Arc::new(|invocation| Ok(json!({"echo": invocation.args}))),
+            }),
+        );
         let request =
             ProcessRequest::new("step-session", message_trigger("run")).with_scope("tool:run");
 
@@ -2841,6 +3137,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_wake_trigger_completes_pending_wake() {
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let now = SystemTime::now();
+        let wake_id = WakeId("wake-1".to_string());
+        store
+            .append_kernel_event(
+                "wake-session",
+                KernelEventRecord {
+                    event_id: "wake-scheduled".to_string(),
+                    occurred_at: now,
+                    event: KernelEvent::WakeScheduled(WakeRequestRecord {
+                        wake_id: wake_id.clone(),
+                        requested_at: now,
+                        due_at: now,
+                        reason: "check later".to_string(),
+                        task_id: None,
+                    }),
+                },
+            )
+            .await
+            .expect("scheduled");
+        assert!(
+            store
+                .load_session("wake-session")
+                .await
+                .expect("snapshot")
+                .agent_state()
+                .pending_wake
+                .is_some()
+        );
+
+        let llm = Arc::new(MockLlmProvider::scripted(vec![AgentAction::Yield {
+            reason: Some("wake handled".to_string()),
+        }]));
+        let engine = AgentEngine::new(llm, store.clone());
+        let outcome = run_until_terminal(
+            &engine,
+            ProcessRequest::new(
+                "wake-session",
+                AgentTrigger::ScheduledWake {
+                    wake_id: wake_id.clone(),
+                    due_at: now,
+                    reason: "check later".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("outcome");
+        assert_eq!(outcome.stop_reason, StopReason::Yielded);
+        let snapshot = store.load_session("wake-session").await.expect("snapshot");
+        assert!(snapshot.agent_state().pending_wake.is_none());
+        assert!(snapshot.records.iter().any(|record| matches!(
+            record,
+            SessionRecord::KernelEvent(KernelEventRecord {
+                event: KernelEvent::WakeCompleted { wake_id: completed, .. },
+                ..
+            }) if completed == &wake_id
+        )));
+    }
+
+    #[tokio::test]
     async fn duplicate_idempotency_key_reuses_prior_outcome() {
         let store = Arc::new(InMemoryMemoryStore::new());
         let llm = Arc::new(MockLlmProvider::scripted(vec![AgentAction::Respond {
@@ -2909,21 +3266,19 @@ mod tests {
 
         for skill_name in ["first", "second"] {
             let local = order.clone();
-            engine
-                .register_wasm_skill(
-                    manifest(skill_name, &["tool:run"]),
-                    Arc::new(StubSkillExecutor {
-                        name: "stub",
-                        responder: Arc::new(move |invocation| {
-                            local
-                                .lock()
-                                .expect("order lock")
-                                .push(invocation.call_id.clone());
-                            Ok(json!({"echo": invocation.args}))
-                        }),
+            engine.register_wasm_skill(
+                manifest(skill_name, &["tool:run"]),
+                Arc::new(StubSkillExecutor {
+                    name: "stub",
+                    responder: Arc::new(move |invocation| {
+                        local
+                            .lock()
+                            .expect("order lock")
+                            .push(invocation.call_id.clone());
+                        Ok(json!({"echo": invocation.args}))
                     }),
-                )
-                .await;
+                }),
+            );
         }
 
         let outcome = run_until_terminal(
@@ -3023,18 +3378,16 @@ mod tests {
             }
         }));
         let engine = AgentEngine::new(llm, store.clone());
-        engine
-            .register_native_skill(
-                SkillManifest {
-                    approval_required: true,
-                    ..manifest("db_fix", &["db:write"])
-                },
-                Arc::new(StubNativeSkill {
-                    requires_approval: true,
-                    responder: Arc::new(|_| Ok(json!({"status": "fixed"}))),
-                }),
-            )
-            .await;
+        engine.register_native_skill(
+            SkillManifest {
+                approval_required: true,
+                ..manifest("db_fix", &["db:write"])
+            },
+            Arc::new(StubNativeSkill {
+                requires_approval: true,
+                responder: Arc::new(|_| Ok(json!({"status": "fixed"}))),
+            }),
+        );
 
         let suspended = run_until_terminal(
             &engine,
@@ -3202,20 +3555,18 @@ mod tests {
             }
         }));
         let engine = AgentEngine::new(llm, store.clone());
-        engine
-            .register_wasm_skill(
-                manifest("unstable", &["tool:run"]),
-                Arc::new(StubSkillExecutor {
-                    name: "unstable",
-                    responder: Arc::new(|_| {
-                        Err(SkillExecutionError::new(
-                            SkillFailureKind::Internal,
-                            "simulated failure",
-                        ))
-                    }),
+        engine.register_wasm_skill(
+            manifest("unstable", &["tool:run"]),
+            Arc::new(StubSkillExecutor {
+                name: "unstable",
+                responder: Arc::new(|_| {
+                    Err(SkillExecutionError::new(
+                        SkillFailureKind::Internal,
+                        "simulated failure",
+                    ))
                 }),
-            )
-            .await;
+            }),
+        );
 
         let mut policy = EnginePolicy::default();
         policy.self_improvement.min_observations_before_tuning = 1;
@@ -3298,25 +3649,23 @@ mod tests {
         let engine = AgentEngine::new(llm, store.clone());
         let calls = Arc::new(Mutex::new(0usize));
         let calls_for_executor = calls.clone();
-        engine
-            .register_wasm_skill(
-                SkillManifest {
-                    input_schema: json!({
-                        "type": "object",
-                        "required": ["value"],
-                        "properties": {"value": {"type": "string"}}
-                    }),
-                    ..manifest("typed_tool", &["tool:run"])
-                },
-                Arc::new(StubSkillExecutor {
-                    name: "typed",
-                    responder: Arc::new(move |_| {
-                        *calls_for_executor.lock().expect("lock") += 1;
-                        Ok(json!({}))
-                    }),
+        engine.register_wasm_skill(
+            SkillManifest {
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["value"],
+                    "properties": {"value": {"type": "string"}}
                 }),
-            )
-            .await;
+                ..manifest("typed_tool", &["tool:run"])
+            },
+            Arc::new(StubSkillExecutor {
+                name: "typed",
+                responder: Arc::new(move |_| {
+                    *calls_for_executor.lock().expect("lock") += 1;
+                    Ok(json!({}))
+                }),
+            }),
+        );
 
         let outcome = run_until_terminal(
             &engine,
@@ -3358,30 +3707,26 @@ mod tests {
         let c2_calls = Arc::new(Mutex::new(0usize));
         let c1_counter = c1_calls.clone();
         let c2_counter = c2_calls.clone();
-        engine
-            .register_wasm_skill(
-                manifest("first", &["tool:run"]),
-                Arc::new(StubSkillExecutor {
-                    name: "first",
-                    responder: Arc::new(move |_| {
-                        *c1_counter.lock().expect("lock") += 1;
-                        Ok(json!({"first": true}))
-                    }),
+        engine.register_wasm_skill(
+            manifest("first", &["tool:run"]),
+            Arc::new(StubSkillExecutor {
+                name: "first",
+                responder: Arc::new(move |_| {
+                    *c1_counter.lock().expect("lock") += 1;
+                    Ok(json!({"first": true}))
                 }),
-            )
-            .await;
-        engine
-            .register_wasm_skill(
-                manifest("second", &["tool:run"]),
-                Arc::new(StubSkillExecutor {
-                    name: "second",
-                    responder: Arc::new(move |_| {
-                        *c2_counter.lock().expect("lock") += 1;
-                        Ok(json!({"second": true}))
-                    }),
+            }),
+        );
+        engine.register_wasm_skill(
+            manifest("second", &["tool:run"]),
+            Arc::new(StubSkillExecutor {
+                name: "second",
+                responder: Arc::new(move |_| {
+                    *c2_counter.lock().expect("lock") += 1;
+                    Ok(json!({"second": true}))
                 }),
-            )
-            .await;
+            }),
+        );
 
         let trigger_id = "trigger-checkpoint".to_string();
         let session_id = "checkpoint-session";
@@ -3391,6 +3736,7 @@ mod tests {
             idempotency_key: None,
             recorded_at: SystemTime::now(),
             trigger: message_trigger("resume"),
+            intent: None,
         };
         store.append_trigger(trigger).await.expect("trigger");
         let calls = vec![
@@ -3524,18 +3870,16 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::<String>::new()));
         for skill_name in ["low", "high"] {
             let order = order.clone();
-            engine
-                .register_wasm_skill(
-                    manifest(skill_name, &["tool:run"]),
-                    Arc::new(StubSkillExecutor {
-                        name: "ordered",
-                        responder: Arc::new(move |invocation| {
-                            order.lock().expect("lock").push(invocation.call_id);
-                            Ok(json!({}))
-                        }),
+            engine.register_wasm_skill(
+                manifest(skill_name, &["tool:run"]),
+                Arc::new(StubSkillExecutor {
+                    name: "ordered",
+                    responder: Arc::new(move |invocation| {
+                        order.lock().expect("lock").push(invocation.call_id);
+                        Ok(json!({}))
                     }),
-                )
-                .await;
+                }),
+            );
         }
 
         let mut policy = EnginePolicy {
