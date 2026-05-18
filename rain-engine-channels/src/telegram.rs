@@ -19,7 +19,7 @@ pub struct TelegramAdapter {
 impl TelegramAdapter {
     pub fn new(token: String, config: ChannelConfig) -> Self {
         Self {
-            engine_client: RainEngineClient::new(&config.gateway_url)
+            engine_client: RainEngineClient::new(&config.runtime_url)
                 .expect("failed to init client"),
             client: reqwest::Client::new(),
             token,

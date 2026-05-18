@@ -9,7 +9,10 @@ use axum::{
     body::to_bytes,
     extract::{Path, Query, Request, State},
     http::{StatusCode, header::CONTENT_TYPE},
-    response::sse::{Event, KeepAlive, Sse},
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use futures_util::stream;
@@ -170,7 +173,7 @@ pub fn install_skill_manifest() -> SkillManifest {
             },
             "required": ["name", "description", "wasm_url", "input_schema"]
         }),
-        required_scopes: vec![],
+        required_scopes: vec!["operator:skills".to_string()],
         capability_grants: vec![],
         resource_policy: ResourcePolicy::default_for_tools(),
         approval_required: true,
@@ -218,7 +221,7 @@ impl NativeSkill for SkillInstallerSkill {
             name: name.to_string(),
             description: description.to_string(),
             input_schema,
-            required_scopes: vec![],
+            required_scopes: vec!["tool:run".to_string()],
             capability_grants: vec![
                 SkillCapability::HttpOutbound {
                     allow_hosts: vec![],
@@ -312,6 +315,8 @@ pub struct RuntimeServerConfig {
     pub allow_policy_overrides: bool,
     pub allow_provider_overrides: bool,
     pub default_provider: ProviderRequestConfig,
+    #[serde(default)]
+    pub async_ingress: bool,
 }
 
 #[typeshare::typeshare]
@@ -411,6 +416,10 @@ pub struct RuntimeState {
     blob_store: Arc<dyn BlobStore>,
     config: RuntimeServerConfig,
     provider_kind: String,
+    default_scopes: Vec<String>,
+    channel_statuses: Vec<RuntimeChannelView>,
+    settings: RuntimeMutableSettings,
+    ingress: Option<Arc<rain_engine_ingress::ValkeyStreamIngress>>,
 }
 
 #[typeshare::typeshare]
@@ -431,6 +440,90 @@ pub enum SessionStatus {
     Delegated,
     Stopped,
     Failed,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivityState {
+    Idle,
+    Reasoning,
+    RunningTools,
+    WaitingHuman,
+    WaitingExternal,
+    Scheduled,
+    Delegated,
+    Errored,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WakeView {
+    pub wake_id: String,
+    pub reason: String,
+    pub status: String,
+    pub occurred_at_ms: i64,
+    pub due_at_ms: Option<i64>,
+    pub task_id: Option<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatStatusView {
+    pub wake_id: String,
+    pub reason: String,
+    pub occurred_at_ms: i64,
+    pub outcome_summary: Option<String>,
+    pub stop_reason: Option<StopReason>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionListItemView {
+    pub session_id: String,
+    pub status: SessionStatus,
+    pub activity_state: SessionActivityState,
+    pub current_focus: Option<String>,
+    pub latest_provider: Option<String>,
+    pub last_activity_at_ms: i64,
+    pub pending_approval: bool,
+    pub pending_wake: bool,
+    pub unread_event_count: usize,
+    pub active_channel_ids: Vec<String>,
+    pub record_count: usize,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeChannelStatus {
+    Connected,
+    Degraded,
+    Disabled,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeChannelView {
+    pub channel_id: String,
+    pub label: String,
+    pub transport: String,
+    pub status: RuntimeChannelStatus,
+    pub detail: Option<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalMetadataSupport {
+    pub structured_json: bool,
+    pub recommended_fields: Vec<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UploadSupport {
+    pub multipart: bool,
+    pub max_request_bytes: usize,
 }
 
 #[typeshare::typeshare]
@@ -556,6 +649,18 @@ pub enum TimelineItem {
 pub struct SessionView {
     pub session_id: String,
     pub status: SessionStatus,
+    pub activity_state: SessionActivityState,
+    pub current_focus: Option<String>,
+    pub current_task_id: Option<String>,
+    pub current_task_title: Option<String>,
+    pub next_wake_at_ms: Option<i64>,
+    pub blocked_reason: Option<String>,
+    pub last_human_input_at_ms: Option<i64>,
+    pub last_assistant_activity_at_ms: Option<i64>,
+    pub active_channel_ids: Vec<String>,
+    pub pending_wake: Option<WakeView>,
+    pub wake_history: Vec<WakeView>,
+    pub last_heartbeat: Option<HeartbeatStatusView>,
     pub last_sequence_no: Option<i64>,
     pub latest_outcome: Option<rain_engine_core::OutcomeRecord>,
     pub pending_approval: Option<ApprovalView>,
@@ -579,7 +684,153 @@ pub struct RuntimeCapabilities {
     pub multipart_uploads: bool,
     pub default_scopes: Vec<String>,
     pub default_policy: EnginePolicy,
+    pub channels: Vec<RuntimeChannelView>,
+    pub approval_metadata: ApprovalMetadataSupport,
+    pub wake_support: bool,
+    pub delegation_support: bool,
+    pub learning_support: bool,
+    pub upload_limits: UploadSupport,
     pub skills: Vec<SkillDefinition>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeSettingsView {
+    pub shell_exec: MutableSkillPolicyView,
+    pub http_fetch: MutableSkillPolicyView,
+    pub web_reader: MutableSkillPolicyView,
+    pub engine_policy: rain_engine_core::EnginePolicy,
+    pub provider_config: rain_engine_core::ProviderRequestConfig,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MutableSkillPolicyView {
+    pub permissive: bool,
+    pub allowlist: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RuntimeSettingsUpdateRequest {
+    #[serde(default)]
+    pub shell_exec: Option<MutableSkillPolicyUpdate>,
+    #[serde(default)]
+    pub http_fetch: Option<MutableSkillPolicyUpdate>,
+    #[serde(default)]
+    pub web_reader: Option<MutableSkillPolicyUpdate>,
+    #[serde(default)]
+    pub engine_policy: Option<rain_engine_core::EnginePolicy>,
+    #[serde(default)]
+    pub provider_config: Option<rain_engine_core::ProviderRequestConfig>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MutableSkillPolicyUpdate {
+    #[serde(default)]
+    pub permissive: Option<bool>,
+    #[serde(default)]
+    pub allowlist: Option<Vec<String>>,
+}
+
+#[derive(Clone)]
+pub struct ManagedSkillPolicy {
+    pub access: rain_engine_skills::SharedAccessPolicy,
+    pub timeout: Duration,
+}
+
+impl ManagedSkillPolicy {
+    pub fn new(access: rain_engine_skills::SharedAccessPolicy, timeout: Duration) -> Self {
+        Self { access, timeout }
+    }
+
+    async fn to_view(&self) -> MutableSkillPolicyView {
+        let policy = self.access.read().await;
+        let mut allowlist = policy.allowlist.iter().cloned().collect::<Vec<_>>();
+        allowlist.sort();
+        MutableSkillPolicyView {
+            permissive: policy.permissive,
+            allowlist,
+            timeout_secs: self.timeout.as_secs(),
+        }
+    }
+
+    async fn apply(&self, update: MutableSkillPolicyUpdate) {
+        let mut policy = self.access.write().await;
+        if let Some(permissive) = update.permissive {
+            policy.permissive = permissive;
+        }
+        if let Some(allowlist) = update.allowlist {
+            policy.allowlist = normalize_allowlist(allowlist);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeMutableSettings {
+    pub shell_exec: ManagedSkillPolicy,
+    pub http_fetch: ManagedSkillPolicy,
+    pub web_reader: ManagedSkillPolicy,
+    pub engine_policy: std::sync::Arc<tokio::sync::RwLock<rain_engine_core::EnginePolicy>>,
+    pub provider_config:
+        std::sync::Arc<tokio::sync::RwLock<rain_engine_core::ProviderRequestConfig>>,
+}
+
+impl RuntimeMutableSettings {
+    pub fn defaults(
+        engine_policy: rain_engine_core::EnginePolicy,
+        provider_config: rain_engine_core::ProviderRequestConfig,
+    ) -> Self {
+        let timeout = Duration::from_secs(30);
+        Self {
+            shell_exec: ManagedSkillPolicy::new(
+                rain_engine_skills::shared_access_policy(HashSet::new(), false),
+                timeout,
+            ),
+            http_fetch: ManagedSkillPolicy::new(
+                rain_engine_skills::shared_access_policy(HashSet::new(), false),
+                timeout,
+            ),
+            web_reader: ManagedSkillPolicy::new(
+                rain_engine_skills::shared_access_policy(HashSet::new(), false),
+                timeout,
+            ),
+            engine_policy: std::sync::Arc::new(tokio::sync::RwLock::new(engine_policy)),
+            provider_config: std::sync::Arc::new(tokio::sync::RwLock::new(provider_config)),
+        }
+    }
+
+    async fn to_view(&self) -> RuntimeSettingsView {
+        let engine_policy = self.engine_policy.read().await.clone();
+        let provider_config = self.provider_config.read().await.clone();
+        RuntimeSettingsView {
+            shell_exec: self.shell_exec.to_view().await,
+            http_fetch: self.http_fetch.to_view().await,
+            web_reader: self.web_reader.to_view().await,
+            engine_policy,
+            provider_config,
+        }
+    }
+
+    async fn apply(&self, update: RuntimeSettingsUpdateRequest) {
+        if let Some(shell_exec) = update.shell_exec {
+            self.shell_exec.apply(shell_exec).await;
+        }
+        if let Some(http_fetch) = update.http_fetch {
+            self.http_fetch.apply(http_fetch).await;
+        }
+        if let Some(web_reader) = update.web_reader {
+            self.web_reader.apply(web_reader).await;
+        }
+        if let Some(engine_policy) = update.engine_policy {
+            *self.engine_policy.write().await = engine_policy;
+        }
+        if let Some(provider_config) = update.provider_config {
+            *self.provider_config.write().await = provider_config;
+        }
+    }
 }
 
 impl RuntimeState {
@@ -588,6 +839,7 @@ impl RuntimeState {
         memory: Arc<dyn MemoryStore>,
         blob_store: Arc<dyn BlobStore>,
         config: RuntimeServerConfig,
+        settings: RuntimeMutableSettings,
     ) -> Self {
         Self {
             engine,
@@ -595,11 +847,35 @@ impl RuntimeState {
             blob_store,
             config,
             provider_kind: "custom".to_string(),
+            default_scopes: vec!["tool:run".to_string()],
+            channel_statuses: Vec::new(),
+            settings,
+            ingress: None,
         }
     }
 
     pub fn with_provider_kind(mut self, provider_kind: impl Into<String>) -> Self {
         self.provider_kind = provider_kind.into();
+        self
+    }
+
+    pub fn with_default_scopes(mut self, default_scopes: Vec<String>) -> Self {
+        self.default_scopes = default_scopes;
+        self
+    }
+
+    pub fn with_channel_statuses(mut self, channel_statuses: Vec<RuntimeChannelView>) -> Self {
+        self.channel_statuses = channel_statuses;
+        self
+    }
+
+    pub fn with_settings(mut self, settings: RuntimeMutableSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    pub fn with_ingress(mut self, ingress: rain_engine_ingress::ValkeyStreamIngress) -> Self {
+        self.ingress = Some(Arc::new(ingress));
         self
     }
 
@@ -614,6 +890,18 @@ impl RuntimeState {
     pub fn blob_store(&self) -> Arc<dyn BlobStore> {
         self.blob_store.clone()
     }
+
+    pub fn settings(&self) -> RuntimeMutableSettings {
+        self.settings.clone()
+    }
+}
+
+fn normalize_allowlist(values: Vec<String>) -> HashSet<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -749,15 +1037,13 @@ pub async fn build_runtime_state(
 
     let mut engine = AgentEngine::new(llm.clone(), memory.clone());
 
-    if let Some(cache_config) = &config.cache {
-        if let Some(valkey_url) = &cache_config.valkey_url {
-            let valkey_cache = rain_engine_core::ValkeyStateCache::new(valkey_url, "rain")
-                .map_err(|err| {
-                    RuntimeConfigError::Invalid(format!("Valkey cache error: {}", err))
-                })?;
-            engine = engine.with_state_cache(Arc::new(valkey_cache));
-            tracing::info!("Configured Valkey state projection cache");
-        }
+    if let Some(cache_config) = &config.cache
+        && let Some(valkey_url) = &cache_config.valkey_url
+    {
+        let valkey_cache = rain_engine_core::ValkeyStateCache::new(valkey_url, "rain")
+            .map_err(|err| RuntimeConfigError::Invalid(format!("Valkey cache error: {}", err)))?;
+        engine = engine.with_state_cache(Arc::new(valkey_cache));
+        tracing::info!("Configured Valkey state projection cache");
     }
 
     if let Some(store) = &skill_store {
@@ -791,20 +1077,28 @@ pub async fn build_runtime_state(
         Arc::new(SkillInstallerSkill::new(engine.clone())),
     );
 
+    let settings = RuntimeMutableSettings::defaults(
+        rain_engine_core::EnginePolicy::default(),
+        rain_engine_core::ProviderRequestConfig::default(),
+    );
     engine.register_native_skill(
         rain_engine_skills::web_reader::manifest(),
-        Arc::new(rain_engine_skills::web_reader::WebReaderSkill::new(
-            HashSet::new(),
-            Duration::from_secs(30),
-        )),
+        Arc::new(
+            rain_engine_skills::web_reader::WebReaderSkill::with_shared_policy(
+                settings.web_reader.access.clone(),
+                settings.web_reader.timeout,
+            ),
+        ),
     );
 
     if config.enable_research_planner {
         engine = engine.with_planner(Arc::new(rain_engine_cognition::ResearchPlanner::new(llm)));
     }
 
-    Ok(RuntimeState::new(engine, memory, blob_store, config.server)
-        .with_provider_kind(provider_kind))
+    Ok(
+        RuntimeState::new(engine, memory, blob_store, config.server, settings)
+            .with_provider_kind(provider_kind),
+    )
 }
 
 pub fn app(state: RuntimeState) -> Router {
@@ -823,7 +1117,12 @@ pub fn app(state: RuntimeState) -> Router {
         // Read routes
         .route("/health", get(handle_health))
         .route("/capabilities", get(handle_capabilities))
+        .route(
+            "/settings",
+            get(handle_get_settings).put(handle_update_settings),
+        )
         .route("/sessions", get(handle_list_sessions))
+        .route("/sessions/views", get(handle_list_session_views))
         .route("/sessions/{session_id}", get(handle_get_session))
         .route("/sessions/{session_id}/view", get(handle_get_session_view))
         .route(
@@ -847,9 +1146,9 @@ async fn handle_external_event(
     State(state): State<RuntimeState>,
     Path(source): Path<String>,
     Json(request): Json<EventIngressRequest>,
-) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
-    let policy = effective_policy(&state.config, request.policy_override);
-    let provider = effective_provider(&state.config, request.provider);
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let policy = effective_policy(&state, request.policy_override).await;
+    let provider = effective_provider(&state, request.provider).await;
     let attachments = materialize_attachments(
         &state,
         policy.max_inline_attachment_bytes,
@@ -880,9 +1179,9 @@ async fn handle_human_input(
     State(state): State<RuntimeState>,
     Path(actor_id): Path<String>,
     Json(request): Json<HumanInputIngressRequest>,
-) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
-    let policy = effective_policy(&state.config, request.policy_override);
-    let provider = effective_provider(&state.config, request.provider);
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let policy = effective_policy(&state, request.policy_override).await;
+    let provider = effective_provider(&state, request.provider).await;
     let attachments = materialize_attachments(
         &state,
         policy.max_inline_attachment_bytes,
@@ -913,9 +1212,9 @@ async fn handle_system_observation(
     State(state): State<RuntimeState>,
     Path(source): Path<String>,
     Json(request): Json<EventIngressRequest>,
-) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
-    let policy = effective_policy(&state.config, request.policy_override);
-    let provider = effective_provider(&state.config, request.provider);
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let policy = effective_policy(&state, request.policy_override).await;
+    let provider = effective_provider(&state, request.provider).await;
     let attachments = materialize_attachments(
         &state,
         policy.max_inline_attachment_bytes,
@@ -945,9 +1244,9 @@ async fn handle_system_observation(
 async fn handle_scheduled_wake(
     State(state): State<RuntimeState>,
     Json(request): Json<ScheduledWakeIngressRequest>,
-) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
-    let policy = effective_policy(&state.config, request.policy_override);
-    let provider = effective_provider(&state.config, request.provider);
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let policy = effective_policy(&state, request.policy_override).await;
+    let provider = effective_provider(&state, request.provider).await;
     run_process_request(
         &state,
         ProcessRequest {
@@ -974,9 +1273,9 @@ pub fn init_tracing() {
 async fn handle_delegation_result(
     State(state): State<RuntimeState>,
     Json(request): Json<DelegationResultIngressRequest>,
-) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
-    let policy = effective_policy(&state.config, request.policy_override);
-    let provider = effective_provider(&state.config, request.provider);
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let policy = effective_policy(&state, request.policy_override).await;
+    let provider = effective_provider(&state, request.provider).await;
     run_process_request(
         &state,
         ProcessRequest {
@@ -1000,12 +1299,12 @@ async fn handle_webhook(
     State(state): State<RuntimeState>,
     Path(source): Path<String>,
     request: Request,
-) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     let envelope = parse_webhook_envelope(request)
         .await
         .map_err(map_ingress_error)?;
-    let policy = effective_policy(&state.config, envelope.policy_override);
-    let provider = effective_provider(&state.config, envelope.provider);
+    let policy = effective_policy(&state, envelope.policy_override).await;
+    let provider = effective_provider(&state, envelope.provider).await;
     let attachments = materialize_attachments(
         &state,
         policy.max_inline_attachment_bytes,
@@ -1036,9 +1335,9 @@ async fn handle_webhook(
 async fn handle_approval(
     State(state): State<RuntimeState>,
     Json(request): Json<ApprovalIngressRequest>,
-) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
-    let policy = effective_policy(&state.config, request.policy_override);
-    let provider = effective_provider(&state.config, request.provider);
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let policy = effective_policy(&state, request.policy_override).await;
+    let provider = effective_provider(&state, request.provider).await;
     run_process_request(
         &state,
         ProcessRequest {
@@ -1199,40 +1498,67 @@ async fn materialize_attachments(
     Ok(attachments)
 }
 
-fn effective_policy(
-    config: &RuntimeServerConfig,
+async fn effective_policy(
+    state: &RuntimeState,
     override_policy: Option<EnginePolicy>,
 ) -> EnginePolicy {
-    if config.allow_policy_overrides {
-        override_policy.unwrap_or_else(|| config.default_policy.clone())
-    } else {
-        config.default_policy.clone()
+    if state.config.allow_policy_overrides
+        && let Some(p) = override_policy
+    {
+        return p;
     }
+    state.settings.engine_policy.read().await.clone()
 }
 
-fn effective_provider(
-    config: &RuntimeServerConfig,
+async fn effective_provider(
+    state: &RuntimeState,
     override_provider: Option<ProviderRequestConfig>,
 ) -> ProviderRequestConfig {
-    if config.allow_provider_overrides {
-        override_provider.unwrap_or_else(|| config.default_provider.clone())
-    } else {
-        config.default_provider.clone()
+    if state.config.allow_provider_overrides
+        && let Some(p) = override_provider
+    {
+        return p;
     }
+    state.settings.provider_config.read().await.clone()
 }
 
 async fn run_process_request(
     state: &RuntimeState,
     mut request: ProcessRequest,
-) -> Result<Json<RuntimeRunResult>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     // Default scopes for simple ingress if none provided
     if request.granted_scopes.is_empty() {
-        request.granted_scopes.insert("tool:run".to_string());
+        request
+            .granted_scopes
+            .extend(state.default_scopes.iter().cloned());
+    }
+
+    if state.config.async_ingress
+        && let Some(ingress) = &state.ingress
+    {
+        let envelope = rain_engine_ingress::IngressEventEnvelope {
+            session_id: request.session_id.clone(),
+            trigger: request.trigger,
+            granted_scopes: request.granted_scopes,
+            idempotency_key: request.idempotency_key,
+            policy: Some(request.policy),
+            provider: Some(request.provider),
+        };
+        ingress
+            .publish(&envelope)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+        let response_body = serde_json::json!({
+            "session_id": request.session_id,
+            "status": "accepted"
+        });
+        return Ok((StatusCode::ACCEPTED, axum::Json(response_body)).into_response());
     }
 
     let timeout = Duration::from_millis(state.config.request_timeout_ms.max(1));
     match tokio::time::timeout(timeout, run_until_terminal_trace(&state.engine, request)).await {
-        Ok(Ok(result)) => Ok(Json(result)),
+        Ok(Ok(result)) => Ok(axum::Json(result).into_response()),
         Ok(Err(err)) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
         Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "request timed out".to_string())),
     }
@@ -1304,10 +1630,39 @@ async fn handle_capabilities(State(state): State<RuntimeState>) -> Json<RuntimeC
         streaming: true,
         approvals: true,
         multipart_uploads: true,
-        default_scopes: vec!["tool:run".to_string()],
+        default_scopes: state.default_scopes.clone(),
         default_policy: state.config.default_policy.clone(),
+        channels: state.channel_statuses.clone(),
+        approval_metadata: ApprovalMetadataSupport {
+            structured_json: true,
+            recommended_fields: vec![
+                "actor_id".to_string(),
+                "client".to_string(),
+                "reason".to_string(),
+                "decided_at_ms".to_string(),
+            ],
+        },
+        wake_support: true,
+        delegation_support: true,
+        learning_support: true,
+        upload_limits: UploadSupport {
+            multipart: true,
+            max_request_bytes: MAX_INGRESS_BODY_BYTES,
+        },
         skills: state.engine.skill_definitions().await,
     })
+}
+
+async fn handle_get_settings(State(state): State<RuntimeState>) -> Json<RuntimeSettingsView> {
+    Json(state.settings.to_view().await)
+}
+
+async fn handle_update_settings(
+    State(state): State<RuntimeState>,
+    Json(request): Json<RuntimeSettingsUpdateRequest>,
+) -> Json<RuntimeSettingsView> {
+    state.settings.apply(request).await;
+    Json(state.settings.to_view().await)
 }
 
 #[typeshare::typeshare]
@@ -1339,6 +1694,45 @@ async fn handle_list_sessions(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
     Ok(Json(serde_json::to_value(sessions).unwrap_or_default()))
+}
+
+async fn handle_list_session_views(
+    State(state): State<RuntimeState>,
+    Query(params): Query<SessionListParams>,
+) -> Result<Json<Vec<SessionListItemView>>, (StatusCode, String)> {
+    let query = SessionListQuery {
+        offset: params.offset.unwrap_or(0),
+        limit: params.limit.unwrap_or(100),
+        since_ms: params.since_ms,
+        until_ms: params.until_ms,
+    };
+    let sessions = state
+        .memory
+        .list_sessions(query)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?;
+
+    let mut views = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let snapshot = if let Ok(Some(cached)) = state
+            .engine
+            .state_cache()
+            .get_projection(&session.session_id)
+            .await
+        {
+            cached
+        } else {
+            state
+                .memory
+                .load_session(&session.session_id)
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.message))?
+        };
+        views.push(build_session_list_item(snapshot));
+    }
+
+    views.sort_by(|left, right| right.last_activity_at_ms.cmp(&left.last_activity_at_ms));
+    Ok(Json(views))
 }
 
 async fn handle_get_session(
@@ -1409,6 +1803,17 @@ async fn handle_install_skill(
     State(state): State<RuntimeState>,
     Json(request): Json<InstallSkillRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let direct_install_enabled = std::env::var("RAIN_ENABLE_DIRECT_SKILL_INSTALL")
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(false);
+    if !direct_install_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "direct skill install is disabled; use operator tooling or set RAIN_ENABLE_DIRECT_SKILL_INSTALL=true"
+                .to_string(),
+        ));
+    }
+
     info!("Attempting to install skill: {}", request.manifest.name);
 
     let wasm_bytes = if let Some(url) = &request.wasm_url {
@@ -1501,13 +1906,41 @@ fn build_session_view(snapshot: SessionSnapshot) -> SessionView {
     let timeline = build_timeline(&snapshot.records);
     let tool_timeline = build_tool_timeline(&snapshot.records);
     let status = derive_session_status(&snapshot, pending_approval.as_ref());
+    let activity_state = derive_activity_state(&snapshot, pending_approval.as_ref());
     let total_estimated_cost_usd = snapshot.total_estimated_cost_usd();
     let self_improvement = build_self_improvement_view(&snapshot);
     let execution_graph = build_execution_graph_view(&snapshot);
+    let current_task = current_task(&state);
+    let active_channel_ids = derive_active_channel_ids(&snapshot.records);
+    let pending_wake = state.pending_wake.as_ref().map(pending_wake_view);
+    let current_focus = derive_current_focus(
+        &snapshot,
+        pending_approval.as_ref(),
+        activity_state.clone(),
+        current_task.as_ref(),
+        pending_wake.as_ref(),
+    );
+    let blocked_reason = derive_blocked_reason(
+        pending_approval.as_ref(),
+        current_task.as_ref(),
+        pending_wake.as_ref(),
+    );
 
     SessionView {
         session_id: snapshot.session_id,
         status,
+        activity_state,
+        current_focus,
+        current_task_id: current_task.as_ref().map(|task| task.task_id.0.clone()),
+        current_task_title: current_task.as_ref().map(|task| task.title.clone()),
+        next_wake_at_ms: pending_wake.as_ref().and_then(|wake| wake.due_at_ms),
+        blocked_reason,
+        last_human_input_at_ms: last_human_input_at_ms(&snapshot.records),
+        last_assistant_activity_at_ms: last_assistant_activity_at_ms(&snapshot.records),
+        active_channel_ids,
+        pending_wake,
+        wake_history: build_wake_history(&snapshot.records),
+        last_heartbeat: build_last_heartbeat(&snapshot.records),
         last_sequence_no: snapshot.last_sequence_no,
         latest_outcome: snapshot.latest_outcome,
         pending_approval,
@@ -1518,6 +1951,36 @@ fn build_session_view(snapshot: SessionSnapshot) -> SessionView {
         execution_graph,
         record_count: snapshot.records.len(),
         total_estimated_cost_usd,
+    }
+}
+
+fn build_session_list_item(snapshot: SessionSnapshot) -> SessionListItemView {
+    let state = snapshot.agent_state();
+    let pending_approval = latest_pending_approval(&snapshot);
+    let status = derive_session_status(&snapshot, pending_approval.as_ref());
+    let activity_state = derive_activity_state(&snapshot, pending_approval.as_ref());
+    let pending_wake = state.pending_wake.as_ref().map(pending_wake_view);
+    let current_task = current_task(&state);
+    let current_focus = derive_current_focus(
+        &snapshot,
+        pending_approval.as_ref(),
+        activity_state.clone(),
+        current_task.as_ref(),
+        pending_wake.as_ref(),
+    );
+
+    SessionListItemView {
+        session_id: snapshot.session_id.clone(),
+        status,
+        activity_state: activity_state.clone(),
+        current_focus,
+        latest_provider: latest_provider_name(&snapshot.records),
+        last_activity_at_ms: last_activity_at_ms(&snapshot.records),
+        pending_approval: pending_approval.is_some(),
+        pending_wake: pending_wake.is_some(),
+        unread_event_count: derive_unread_event_count(&snapshot.records),
+        active_channel_ids: derive_active_channel_ids(&snapshot.records),
+        record_count: snapshot.records.len(),
     }
 }
 
@@ -1613,6 +2076,423 @@ fn derive_session_status(
         ) => SessionStatus::Failed,
         Some(StopReason::MaxStepsReached) => SessionStatus::Stopped,
     }
+}
+
+fn derive_activity_state(
+    snapshot: &SessionSnapshot,
+    pending_approval: Option<&ApprovalView>,
+) -> SessionActivityState {
+    if pending_approval.is_some() {
+        return SessionActivityState::WaitingHuman;
+    }
+
+    if snapshot.active_tool_execution_graph().is_some() {
+        return SessionActivityState::RunningTools;
+    }
+
+    if snapshot
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            SessionRecord::Deliberation(_) => Some(SessionActivityState::Reasoning),
+            SessionRecord::Delegation(_) => Some(SessionActivityState::Delegated),
+            SessionRecord::KernelEvent(event) => match &event.event {
+                rain_engine_core::KernelEvent::TaskBlocked { .. } => {
+                    Some(SessionActivityState::WaitingExternal)
+                }
+                rain_engine_core::KernelEvent::WakeRequested(_)
+                | rain_engine_core::KernelEvent::WakeScheduled(_) => {
+                    Some(SessionActivityState::Scheduled)
+                }
+                _ => None,
+            },
+            SessionRecord::Outcome(outcome) => match outcome.stop_reason {
+                StopReason::Delegated => Some(SessionActivityState::Delegated),
+                StopReason::ProviderFailure
+                | StopReason::StorageFailure
+                | StopReason::PolicyAborted
+                | StopReason::DeadlineExceeded
+                | StopReason::Cancelled => Some(SessionActivityState::Errored),
+                _ => None,
+            },
+            _ => None,
+        })
+        .is_some()
+    {
+        return snapshot
+            .records
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                SessionRecord::Deliberation(_) => Some(SessionActivityState::Reasoning),
+                SessionRecord::Delegation(_) => Some(SessionActivityState::Delegated),
+                SessionRecord::KernelEvent(event) => match &event.event {
+                    rain_engine_core::KernelEvent::TaskBlocked { .. } => {
+                        Some(SessionActivityState::WaitingExternal)
+                    }
+                    rain_engine_core::KernelEvent::WakeRequested(_)
+                    | rain_engine_core::KernelEvent::WakeScheduled(_) => {
+                        Some(SessionActivityState::Scheduled)
+                    }
+                    _ => None,
+                },
+                SessionRecord::Outcome(outcome) => match outcome.stop_reason {
+                    StopReason::Delegated => Some(SessionActivityState::Delegated),
+                    StopReason::ProviderFailure
+                    | StopReason::StorageFailure
+                    | StopReason::PolicyAborted
+                    | StopReason::DeadlineExceeded
+                    | StopReason::Cancelled => Some(SessionActivityState::Errored),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or(SessionActivityState::Idle);
+    }
+
+    match snapshot
+        .latest_outcome
+        .as_ref()
+        .map(|outcome| &outcome.stop_reason)
+    {
+        Some(StopReason::Delegated) => SessionActivityState::Delegated,
+        Some(
+            StopReason::ProviderFailure
+            | StopReason::StorageFailure
+            | StopReason::PolicyAborted
+            | StopReason::DeadlineExceeded
+            | StopReason::Cancelled,
+        ) => SessionActivityState::Errored,
+        _ if snapshot.agent_state().pending_wake.is_some() => SessionActivityState::Scheduled,
+        _ => SessionActivityState::Idle,
+    }
+}
+
+fn current_task(state: &AgentStateSnapshot) -> Option<rain_engine_core::TaskRecord> {
+    let priority_order = |status: &rain_engine_core::TaskStatus| match status {
+        rain_engine_core::TaskStatus::Running => 0,
+        rain_engine_core::TaskStatus::Ready => 1,
+        rain_engine_core::TaskStatus::WaitingHuman => 2,
+        rain_engine_core::TaskStatus::Blocked => 3,
+        rain_engine_core::TaskStatus::Pending => 4,
+        rain_engine_core::TaskStatus::Failed => 5,
+        rain_engine_core::TaskStatus::Done => 6,
+        rain_engine_core::TaskStatus::Abandoned => 7,
+    };
+
+    state
+        .tasks
+        .iter()
+        .filter(|task| {
+            !matches!(
+                task.status,
+                rain_engine_core::TaskStatus::Done | rain_engine_core::TaskStatus::Abandoned
+            )
+        })
+        .min_by_key(|task| (priority_order(&task.status), unix_time_ms(task.created_at)))
+        .cloned()
+}
+
+fn derive_current_focus(
+    snapshot: &SessionSnapshot,
+    pending_approval: Option<&ApprovalView>,
+    activity_state: SessionActivityState,
+    current_task: Option<&rain_engine_core::TaskRecord>,
+    pending_wake: Option<&WakeView>,
+) -> Option<String> {
+    if let Some(approval) = pending_approval {
+        return Some(approval.reason.clone());
+    }
+
+    if let Some(task) = current_task {
+        return Some(match task.status {
+            rain_engine_core::TaskStatus::Running => format!("Working on {}", task.title),
+            rain_engine_core::TaskStatus::Ready => format!("Ready to start {}", task.title),
+            rain_engine_core::TaskStatus::WaitingHuman => {
+                format!("Awaiting approval for {}", task.title)
+            }
+            rain_engine_core::TaskStatus::Blocked => format!("Blocked on {}", task.title),
+            rain_engine_core::TaskStatus::Pending => format!("Queued {}", task.title),
+            rain_engine_core::TaskStatus::Failed => format!("Recovering {}", task.title),
+            rain_engine_core::TaskStatus::Done | rain_engine_core::TaskStatus::Abandoned => {
+                task.title.clone()
+            }
+        });
+    }
+
+    if let Some(wake) = pending_wake {
+        return Some(format!("Scheduled wake: {}", wake.reason));
+    }
+
+    if let Some(deliberation) = snapshot
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            SessionRecord::Deliberation(deliberation) => Some(deliberation.summary.clone()),
+            _ => None,
+        })
+    {
+        return Some(deliberation);
+    }
+
+    if let Some(outcome) = snapshot.latest_outcome.as_ref() {
+        return outcome
+            .response
+            .clone()
+            .or_else(|| outcome.detail.clone())
+            .map(|text| truncate_preview(&text));
+    }
+
+    Some(match activity_state {
+        SessionActivityState::RunningTools => "Executing tools".to_string(),
+        SessionActivityState::Reasoning => "Evaluating next action".to_string(),
+        SessionActivityState::WaitingExternal => "Waiting on external state".to_string(),
+        SessionActivityState::Scheduled => "Waiting for scheduled wake".to_string(),
+        SessionActivityState::Delegated => "Waiting on delegated work".to_string(),
+        SessionActivityState::Errored => "Investigating a failed step".to_string(),
+        SessionActivityState::WaitingHuman => "Waiting on a human decision".to_string(),
+        SessionActivityState::Idle => "Idle until the next event".to_string(),
+    })
+}
+
+fn derive_blocked_reason(
+    pending_approval: Option<&ApprovalView>,
+    current_task: Option<&rain_engine_core::TaskRecord>,
+    pending_wake: Option<&WakeView>,
+) -> Option<String> {
+    if let Some(approval) = pending_approval {
+        return Some(approval.reason.clone());
+    }
+    if let Some(task) = current_task
+        && matches!(
+            task.status,
+            rain_engine_core::TaskStatus::Blocked | rain_engine_core::TaskStatus::WaitingHuman
+        )
+    {
+        return task.detail.clone().or_else(|| {
+            if task.blocked_by.is_empty() {
+                None
+            } else {
+                Some(format!("blocked by {}", task.blocked_by.len()))
+            }
+        });
+    }
+    pending_wake.map(|wake| wake.reason.clone())
+}
+
+fn derive_active_channel_ids(records: &[SessionRecord]) -> Vec<String> {
+    let mut channels = BTreeSet::new();
+    for record in records {
+        if let SessionRecord::Trigger(trigger) = record {
+            match &trigger.trigger {
+                AgentTrigger::HumanInput { actor_id, .. }
+                | AgentTrigger::Message {
+                    user_id: actor_id, ..
+                } => {
+                    if let Some((channel, _)) = actor_id.split_once(':') {
+                        channels.insert(channel.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    channels.into_iter().collect()
+}
+
+fn last_human_input_at_ms(records: &[SessionRecord]) -> Option<i64> {
+    records.iter().rev().find_map(|record| match record {
+        SessionRecord::Trigger(trigger)
+            if matches!(
+                trigger.trigger,
+                AgentTrigger::HumanInput { .. } | AgentTrigger::Message { .. }
+            ) =>
+        {
+            Some(unix_time_ms(trigger.recorded_at))
+        }
+        _ => None,
+    })
+}
+
+fn last_assistant_activity_at_ms(records: &[SessionRecord]) -> Option<i64> {
+    records.iter().rev().find_map(|record| match record {
+        SessionRecord::Outcome(outcome) => Some(unix_time_ms(outcome.finished_at)),
+        SessionRecord::ToolResult(result) => Some(unix_time_ms(result.finished_at)),
+        SessionRecord::Deliberation(deliberation) => Some(unix_time_ms(deliberation.created_at)),
+        _ => None,
+    })
+}
+
+fn last_activity_at_ms(records: &[SessionRecord]) -> i64 {
+    records
+        .iter()
+        .rev()
+        .find_map(record_occurred_at_ms)
+        .unwrap_or_default()
+}
+
+fn record_occurred_at_ms(record: &SessionRecord) -> Option<i64> {
+    match record {
+        SessionRecord::Trigger(trigger) => Some(unix_time_ms(trigger.recorded_at)),
+        SessionRecord::TriggerIntent(intent) => Some(unix_time_ms(intent.classified_at)),
+        SessionRecord::KernelEvent(event) => Some(unix_time_ms(event.occurred_at)),
+        SessionRecord::ModelDecision(decision) => Some(unix_time_ms(decision.decided_at)),
+        SessionRecord::Deliberation(deliberation) => Some(unix_time_ms(deliberation.created_at)),
+        SessionRecord::ToolExecutionGraph(graph) => Some(unix_time_ms(graph.created_at)),
+        SessionRecord::ToolNodeCheckpoint(checkpoint) => Some(unix_time_ms(checkpoint.occurred_at)),
+        SessionRecord::SkillInputValidation(validation) => {
+            Some(unix_time_ms(validation.validated_at))
+        }
+        SessionRecord::ToolCall(call) => Some(unix_time_ms(call.called_at)),
+        SessionRecord::ToolResult(result) => Some(unix_time_ms(result.finished_at)),
+        SessionRecord::PendingApproval(approval) => Some(unix_time_ms(approval.created_at)),
+        SessionRecord::ApprovalResolution(resolution) => Some(unix_time_ms(resolution.resolved_at)),
+        SessionRecord::Delegation(delegation) => Some(unix_time_ms(delegation.created_at)),
+        SessionRecord::CoordinationClaim(claim) => Some(unix_time_ms(claim.claimed_at)),
+        SessionRecord::ProviderUsage(usage) => Some(unix_time_ms(usage.recorded_at)),
+        SessionRecord::ProviderCache(cache) => Some(unix_time_ms(cache.cached_at)),
+        SessionRecord::Reflection(reflection) => Some(unix_time_ms(reflection.created_at)),
+        SessionRecord::PolicyTuning(tuning) => Some(unix_time_ms(tuning.created_at)),
+        SessionRecord::StrategyPreference(preference) => Some(unix_time_ms(preference.created_at)),
+        SessionRecord::ToolPerformance(perf) => Some(unix_time_ms(perf.created_at)),
+        SessionRecord::ProfilePatch(patch) => Some(unix_time_ms(patch.created_at)),
+        SessionRecord::ExecutionPlan(plan) => Some(unix_time_ms(plan.created_at)),
+        SessionRecord::Summary(summary) => Some(unix_time_ms(summary.created_at)),
+        SessionRecord::Outcome(outcome) => Some(unix_time_ms(outcome.finished_at)),
+    }
+}
+
+fn latest_provider_name(records: &[SessionRecord]) -> Option<String> {
+    records.iter().rev().find_map(|record| match record {
+        SessionRecord::ProviderUsage(usage) => Some(usage.provider_name.clone()),
+        _ => None,
+    })
+}
+
+fn derive_unread_event_count(records: &[SessionRecord]) -> usize {
+    let last_human_at = last_human_input_at_ms(records).unwrap_or_default();
+    records
+        .iter()
+        .filter(|record| {
+            record_occurred_at_ms(record).is_some_and(|at| {
+                at >= last_human_at
+                    && !matches!(
+                        record,
+                        SessionRecord::Trigger(trigger)
+                            if matches!(
+                                trigger.trigger,
+                                AgentTrigger::HumanInput { .. } | AgentTrigger::Message { .. }
+                            )
+                    )
+            })
+        })
+        .count()
+}
+
+fn pending_wake_view(wake: &rain_engine_core::WakeRequestRecord) -> WakeView {
+    WakeView {
+        wake_id: wake.wake_id.0.clone(),
+        reason: wake.reason.clone(),
+        status: "scheduled".to_string(),
+        occurred_at_ms: unix_time_ms(wake.requested_at),
+        due_at_ms: Some(unix_time_ms(wake.due_at)),
+        task_id: wake.task_id.as_ref().map(|task_id| task_id.0.clone()),
+    }
+}
+
+fn build_wake_history(records: &[SessionRecord]) -> Vec<WakeView> {
+    let mut wakes = Vec::new();
+    for record in records.iter().rev() {
+        match record {
+            SessionRecord::KernelEvent(event) => match &event.event {
+                rain_engine_core::KernelEvent::WakeRequested(wake)
+                | rain_engine_core::KernelEvent::WakeScheduled(wake) => wakes.push(WakeView {
+                    wake_id: wake.wake_id.0.clone(),
+                    reason: wake.reason.clone(),
+                    status: "scheduled".to_string(),
+                    occurred_at_ms: unix_time_ms(event.occurred_at),
+                    due_at_ms: Some(unix_time_ms(wake.due_at)),
+                    task_id: wake.task_id.as_ref().map(|task_id| task_id.0.clone()),
+                }),
+                rain_engine_core::KernelEvent::WakeCompleted {
+                    wake_id, reason, ..
+                } => {
+                    wakes.push(WakeView {
+                        wake_id: wake_id.0.clone(),
+                        reason: reason.clone(),
+                        status: "completed".to_string(),
+                        occurred_at_ms: unix_time_ms(event.occurred_at),
+                        due_at_ms: None,
+                        task_id: None,
+                    });
+                }
+                _ => {}
+            },
+            SessionRecord::Trigger(trigger)
+                if matches!(trigger.trigger, AgentTrigger::ScheduledWake { .. }) =>
+            {
+                if let AgentTrigger::ScheduledWake {
+                    wake_id,
+                    due_at,
+                    reason,
+                } = &trigger.trigger
+                {
+                    wakes.push(WakeView {
+                        wake_id: wake_id.0.clone(),
+                        reason: reason.clone(),
+                        status: "fired".to_string(),
+                        occurred_at_ms: unix_time_ms(trigger.recorded_at),
+                        due_at_ms: Some(unix_time_ms(*due_at)),
+                        task_id: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+        if wakes.len() >= 12 {
+            break;
+        }
+    }
+    wakes
+}
+
+fn build_last_heartbeat(records: &[SessionRecord]) -> Option<HeartbeatStatusView> {
+    let mut latest_wake: Option<(String, String, i64)> = None;
+    for record in records.iter().rev() {
+        if let SessionRecord::Trigger(trigger) = record
+            && let AgentTrigger::ScheduledWake {
+                wake_id, reason, ..
+            } = &trigger.trigger
+            && reason.to_ascii_lowercase().contains("heartbeat")
+        {
+            latest_wake = Some((
+                wake_id.0.clone(),
+                reason.clone(),
+                unix_time_ms(trigger.recorded_at),
+            ));
+            break;
+        }
+    }
+
+    let (wake_id, reason, occurred_at_ms) = latest_wake?;
+    let outcome = records.iter().rev().find_map(|record| match record {
+        SessionRecord::Outcome(outcome) if unix_time_ms(outcome.finished_at) >= occurred_at_ms => {
+            Some(outcome)
+        }
+        _ => None,
+    });
+
+    Some(HeartbeatStatusView {
+        wake_id,
+        reason,
+        occurred_at_ms,
+        outcome_summary: outcome
+            .and_then(|outcome| outcome.response.clone().or_else(|| outcome.detail.clone()))
+            .map(|text| truncate_preview(&text)),
+        stop_reason: outcome.map(|outcome| outcome.stop_reason.clone()),
+    })
 }
 
 fn latest_pending_approval(snapshot: &SessionSnapshot) -> Option<ApprovalView> {
@@ -1727,6 +2607,14 @@ fn build_timeline(records: &[SessionRecord]) -> Vec<TimelineItem> {
                 occurred_at_ms: unix_time_ms(intent.classified_at),
             }),
             SessionRecord::KernelEvent(event) => match &event.event {
+                rain_engine_core::KernelEvent::WakeRequested(wake)
+                | rain_engine_core::KernelEvent::WakeScheduled(wake) => {
+                    Some(TimelineItem::System {
+                        label: "wake scheduled".to_string(),
+                        detail: format!("{} · {}", wake.wake_id.0, wake.reason),
+                        occurred_at_ms: unix_time_ms(event.occurred_at),
+                    })
+                }
                 rain_engine_core::KernelEvent::WakeCompleted {
                     wake_id, reason, ..
                 } => Some(TimelineItem::System {
@@ -1945,8 +2833,21 @@ async fn handle_sse_stream(
             let current_seq = snapshot.last_sequence_no;
             if current_seq != last_seq {
                 last_seq = current_seq;
-                if let Ok(json) = serde_json::to_string(&build_session_view(snapshot.clone())) {
+                let session_view = build_session_view(snapshot.clone());
+                if let Ok(json) = serde_json::to_string(&session_view) {
                     yield Ok(Event::default().event("session_view").data(json));
+                }
+                if let Ok(json) = serde_json::to_string(&session_view.execution_graph) {
+                    yield Ok(Event::default().event("execution_graph").data(json));
+                }
+                if let Ok(json) = serde_json::to_string(&session_view.self_improvement) {
+                    yield Ok(Event::default().event("learning").data(json));
+                }
+                if let Ok(json) = serde_json::to_string(&session_view.pending_approval) {
+                    yield Ok(Event::default().event("approval").data(json));
+                }
+                if let Ok(json) = serde_json::to_string(&session_view.wake_history) {
+                    yield Ok(Event::default().event("wake").data(json));
                 }
                 if let Ok(json) = serde_json::to_string(&snapshot.records) {
                     yield Ok(Event::default().event("records").data(json));
@@ -1999,6 +2900,7 @@ mod tests {
             allow_policy_overrides: true,
             allow_provider_overrides: true,
             default_provider: ProviderRequestConfig::default(),
+            async_ingress: false,
         }
     }
 
@@ -2010,11 +2912,17 @@ mod tests {
             Arc::new(MockLlmProvider::scripted(vec![AgentAction::Respond {
                 content: response.to_string(),
             }]));
+        let config = server_config();
+        let settings = RuntimeMutableSettings::defaults(
+            config.default_policy.clone(),
+            config.default_provider.clone(),
+        );
         RuntimeState::new(
             AgentEngine::new(llm, memory.clone()),
             memory,
             blob_store,
-            server_config(),
+            config,
+            settings,
         )
     }
 
@@ -2074,6 +2982,8 @@ mod tests {
             serde_json::from_slice(&bytes).expect("capabilities");
         assert!(capabilities.streaming);
         assert!(capabilities.approvals);
+        assert!(capabilities.wake_support);
+        assert!(capabilities.learning_support);
         assert!(
             capabilities
                 .default_scopes
@@ -2123,13 +3033,68 @@ mod tests {
             .expect("body");
         let view: SessionView = serde_json::from_slice(&bytes).expect("session view");
         assert_eq!(view.status, SessionStatus::Completed);
+        assert_eq!(view.activity_state, SessionActivityState::Idle);
         assert!(view.record_count >= 3);
+        assert!(view.current_focus.is_some());
         assert!(
             view.timeline
                 .iter()
                 .any(|item| matches!(item, TimelineItem::AssistantResponse { .. }))
         );
         assert!(!view.self_improvement.reflections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_list_views_include_presence_metadata() {
+        let state = runtime_state_with_mock("processed");
+        let router = app(state.clone());
+
+        let response = router
+            .oneshot(
+                Request::post("/triggers/human/telegram:42")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&HumanInputIngressRequest {
+                            session_id: "presence-session".to_string(),
+                            content: "check status".to_string(),
+                            attachments: Vec::new(),
+                            granted_scopes: BTreeSet::new(),
+                            idempotency_key: None,
+                            provider: None,
+                            policy_override: None,
+                        })
+                        .expect("request json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let list_response = app(state)
+            .oneshot(
+                Request::get("/sessions/views")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let views: Vec<SessionListItemView> =
+            serde_json::from_slice(&bytes).expect("session list views");
+        let view = views
+            .iter()
+            .find(|session| session.session_id == "presence-session")
+            .expect("presence session view");
+        assert_eq!(view.status, SessionStatus::Completed);
+        assert_eq!(view.activity_state, SessionActivityState::Idle);
+        assert!(view.current_focus.is_some());
+        assert_eq!(view.active_channel_ids, vec!["telegram".to_string()]);
+        assert!(view.record_count >= 3);
     }
 
     #[tokio::test]
@@ -2143,11 +3108,16 @@ mod tests {
             }]));
         let mut config = server_config();
         config.default_policy.max_inline_attachment_bytes = 4;
+        let settings = RuntimeMutableSettings::defaults(
+            config.default_policy.clone(),
+            config.default_provider.clone(),
+        );
         let state = RuntimeState::new(
             AgentEngine::new(llm, memory.clone()),
             memory.clone(),
             blob_store,
             config,
+            settings,
         );
 
         let boundary = "rain-engine-boundary";
@@ -2216,11 +3186,17 @@ mod tests {
                 content: "completed".to_string(),
             },
         ]));
+        let config = server_config();
+        let settings = RuntimeMutableSettings::defaults(
+            config.default_policy.clone(),
+            config.default_provider.clone(),
+        );
         let state = RuntimeState::new(
             AgentEngine::new(llm, memory.clone()),
             memory,
             blob_store,
-            server_config(),
+            config,
+            settings,
         );
         state.engine().register_native_skill(
             SkillManifest {

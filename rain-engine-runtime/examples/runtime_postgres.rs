@@ -18,6 +18,7 @@ fn main() {
                 temperature: Some(0.1),
                 max_tokens: Some(512),
             },
+            async_ingress: false,
         },
         store: StoreBootstrapConfig::Postgres {
             database_url: "postgres://postgres:postgres@localhost/rain_engine".to_string(),

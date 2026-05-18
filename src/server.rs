@@ -25,6 +25,7 @@ impl Default for ServerBuilder {
                         temperature: None,
                         max_tokens: None,
                     },
+                    async_ingress: false,
                 },
                 store: StoreBootstrapConfig::InMemory, // Portable by default
                 cache: None,

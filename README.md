@@ -1,7 +1,7 @@
 # RainEngine
 
-RainEngine is a self-improving, event-sourced Rust kernel for building durable
-AI agent systems.
+RainEngine is a self-improving, event-sourced Rust library workspace for
+building durable AI agent systems.
 
 The core idea is simple: an agent is a state machine backed by an append-only
 ledger. Every webhook, human message, scheduled wake, approval, delegation
@@ -19,23 +19,19 @@ visible, auditable, and never grants new power silently.
 - `rain-engine-core`: provider-neutral event kernel, domain models, policies, traits, ledger projections, and in-memory stores
 - `rain-engine-cognition`: optional planners, task routing, review policy, wake policy, and reflection policy
 - `rain-engine-memory`: ledger-backed exact replay, recent working sets, graph lookup, and simple semantic retrieval
-- `rain-engine-runtime`: reference Axum runtime that parses events and owns the advance loop
-- `rain-engine-gateway`: batteries-included gateway that wires runtime, built-in skills, channels, and wake handling
-- `rain-engine-ui`: Solid/Vite control room for live session inspection and human approval
-- `rain-engine-client`: Rust client for gateway integrations
-- `sdk/typescript`: TypeScript SDK for browser and Node clients
+- `rain-engine-runtime`: reference Axum runtime library that parses events and owns the advance loop
+- `rain-engine-client`: Rust client for runtime integrations
 - `rain-engine-ingress`: shared event envelope and Valkey Streams worker utilities
 - `rain-engine-blob`: local and in-memory blob stores for multimodal attachments
 - `rain-engine-wasm`: Wasmtime executor for untrusted skills with explicit host capabilities
 - `rain-engine-macros`: `#[derive(SkillManifest)]` for typed skill manifests
-- `rain-engine-skills`: built-in trusted native skills for local development and gateway deployments
+- `rain-engine-skills`: built-in trusted native skills for local development and runtime-backed deployments
 - `rain-engine-channels`: channel adapters that translate external messages into kernel events
 - `rain-engine-provider-gemini`: Gemini REST provider with multimodal content, parallel tool calls, and cache metadata
 - `rain-engine-openai`: OpenAI-compatible baseline provider
 - `rain-engine-store-pg`: Postgres append-only ledger store
 - `rain-engine-store-sqlite`: SQLite ledger store for local development and tests
 - `rain-engine-store-valkey`: Valkey coordination claims and short-lived scratchpad storage
-- `rain-engine-cli`: declarative `agent.yaml` validation and runtime bootstrapping
 
 ## Architecture
 
@@ -101,37 +97,13 @@ Guardrails are explicit:
 - regressions create rollback records and remove the overlay from future
   effective policy
 
-## Control Room
+## Library Surface
 
-RainEngine includes a web control room for operating the kernel through the
-server-client contract. The UI connects to the gateway, streams session updates
-over server-sent events, and renders the ledger as a live workbench:
-
-- session status, provider capabilities, and registered tools
-- human input and assistant outcomes
-- reasoning plans, tool execution graphs, checkpoints, validation failures, and
-  tool results
-- approval checkpoints with exact arguments and structured approve/deny actions
-- learning events, active policy overlays, reflections, and rollback history
-- projected goals, tasks, observations, artifacts, and raw records
-
-Start the development gateway:
-
-```bash
-cargo run -p rain-engine-cli -- dev
-```
-
-Then run the UI:
-
-```bash
-cd rain-engine-ui
-npm install
-npm run dev
-```
-
-The runtime exposes `GET /capabilities`, `GET /sessions/{id}/view`, and
-`GET /sessions/{id}/stream` so other clients can build the same control surface
-without depending on UI internals.
+RainEngine intentionally stops at reusable libraries. There are no first-party
+CLI, standalone daemon binary, or browser UI surfaces in this repository. The runtime,
+client, ingress, store, and provider crates are intended to be embedded in
+other systems that provide their own process model, configuration UX, and
+operator tooling.
 
 ## State Model
 
@@ -151,8 +123,6 @@ must be rebuildable from stored records.
 
 - Embedded SQLite flow: [embedded_sqlite.rs](/Users/adrift/projects/rain-engine/rain-engine-runtime/examples/embedded_sqlite.rs)
 - Runtime bootstrap config: [runtime_postgres.rs](/Users/adrift/projects/rain-engine/rain-engine-runtime/examples/runtime_postgres.rs)
-- Customer support deployment sketch: [customer_support_agent.rs](/Users/adrift/projects/rain-engine/rain-engine-cli/examples/customer_support_agent.rs)
-- Declarative deployment config: [agent.yaml](/Users/adrift/projects/rain-engine/rain-engine-cli/examples/agent.yaml)
 
 ## Verification
 
@@ -160,5 +130,4 @@ must be rebuildable from stored records.
 cargo fmt
 cargo clippy --workspace --all-targets
 cargo test --workspace --all-targets --quiet
-cd rain-engine-ui && npm run build
 ```

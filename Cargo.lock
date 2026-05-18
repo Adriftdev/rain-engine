@@ -2002,6 +2002,7 @@ name = "rain-engine-channels"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "rain-engine-client",
  "reqwest",
  "serde",
@@ -2009,24 +2010,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "rain-engine-cli"
-version = "0.1.0"
-dependencies = [
- "dotenvy",
- "rain-engine",
- "rain-engine-blob",
- "rain-engine-core",
- "rain-engine-ingress",
- "rain-engine-runtime",
- "rain-engine-store-valkey",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
@@ -2070,29 +2053,6 @@ dependencies = [
  "tracing",
  "typeshare",
  "uuid",
-]
-
-[[package]]
-name = "rain-engine-gateway"
-version = "0.1.0"
-dependencies = [
- "axum",
- "dotenvy",
- "rain-engine",
- "rain-engine-blob",
- "rain-engine-channels",
- "rain-engine-client",
- "rain-engine-core",
- "rain-engine-runtime",
- "rain-engine-skills",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
- "tokio-util",
- "tower-http",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2173,6 +2133,7 @@ dependencies = [
  "rain-engine-blob",
  "rain-engine-cognition",
  "rain-engine-core",
+ "rain-engine-ingress",
  "rain-engine-macros",
  "rain-engine-openai",
  "rain-engine-provider-gemini",

@@ -1,46 +1,52 @@
 //! Shell command execution skill with default-deny allowlist.
 
+use crate::{AccessPolicy, SharedAccessPolicy, shared_access_policy};
 use async_trait::async_trait;
 use rain_engine_core::{
     NativeSkill, SkillExecutionError, SkillFailureKind, SkillInvocation, SkillManifest,
 };
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::warn;
 
 pub struct ShellExecSkill {
-    allowed_commands: HashSet<String>,
+    policy: SharedAccessPolicy,
     timeout: Duration,
-    permissive: bool,
 }
 
 impl ShellExecSkill {
     /// Create with explicit allowlist. Empty set = deny all.
-    pub fn new(allowed_commands: HashSet<String>, timeout: Duration) -> Self {
+    pub fn new(allowed_commands: std::collections::HashSet<String>, timeout: Duration) -> Self {
         Self {
-            allowed_commands,
+            policy: shared_access_policy(allowed_commands, false),
             timeout,
-            permissive: false,
         }
     }
 
     /// Permissive mode — allows any command (use only in dev).
     pub fn permissive(timeout: Duration) -> Self {
         Self {
-            allowed_commands: HashSet::new(),
+            policy: shared_access_policy(std::collections::HashSet::new(), true),
             timeout,
-            permissive: true,
         }
     }
 
-    fn is_allowed(&self, command: &str) -> bool {
-        if self.permissive {
+    pub fn with_shared_policy(policy: SharedAccessPolicy, timeout: Duration) -> Self {
+        Self { policy, timeout }
+    }
+
+    async fn is_allowed(&self, command: &str) -> bool {
+        let policy = self.policy.read().await;
+        if policy.permissive {
             return true;
         }
         let executable = command.split_whitespace().next().unwrap_or("");
-        self.allowed_commands.contains(executable)
+        policy.allowlist.contains(executable)
+    }
+
+    pub async fn access_policy(&self) -> AccessPolicy {
+        self.policy.read().await.clone()
     }
 }
 
@@ -66,7 +72,7 @@ impl NativeSkill for ShellExecSkill {
             SkillExecutionError::new(SkillFailureKind::InvalidResponse, "missing 'command' arg")
         })?;
 
-        if !self.is_allowed(command) {
+        if !self.is_allowed(command).await {
             warn!(command = %command, "shell_exec: command not on allowlist");
             return Err(SkillExecutionError::new(
                 SkillFailureKind::PermissionDenied,
@@ -161,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_allowlist_denies_by_default() {
-        let skill = ShellExecSkill::new(HashSet::new(), Duration::from_secs(1));
+        let skill = ShellExecSkill::new(std::collections::HashSet::new(), Duration::from_secs(1));
         let err = skill
             .execute(invocation("echo denied"))
             .await

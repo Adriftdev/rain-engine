@@ -1,7 +1,8 @@
 //! # RainEngine
 //!
 //! An event-sourced Rust kernel for building durable AI agent systems.
-//! This crate provides a high-level server and client API for event-driven agent systems.
+//! This crate re-exports the core execution types plus optional runtime and
+//! client library surfaces for event-driven agent systems.
 
 #[cfg(feature = "server")]
 pub mod server;

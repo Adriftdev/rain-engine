@@ -1,49 +1,59 @@
 //! HTTP fetch skill with host allowlist.
 
+use crate::{AccessPolicy, SharedAccessPolicy, shared_access_policy};
 use async_trait::async_trait;
 use rain_engine_core::{
     NativeSkill, SkillExecutionError, SkillFailureKind, SkillInvocation, SkillManifest,
 };
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::time::Duration;
 use tracing::warn;
 
 pub struct HttpFetchSkill {
     client: reqwest::Client,
-    allowed_hosts: HashSet<String>,
+    policy: SharedAccessPolicy,
     timeout: Duration,
-    permissive: bool,
 }
 
 impl HttpFetchSkill {
     /// Create with host allowlist. Empty set = deny all.
-    pub fn new(allowed_hosts: HashSet<String>, timeout: Duration) -> Self {
+    pub fn new(allowed_hosts: std::collections::HashSet<String>, timeout: Duration) -> Self {
         Self {
             client: reqwest::Client::new(),
-            allowed_hosts,
+            policy: shared_access_policy(allowed_hosts, false),
             timeout,
-            permissive: false,
         }
     }
 
     pub fn permissive(timeout: Duration) -> Self {
         Self {
             client: reqwest::Client::new(),
-            allowed_hosts: HashSet::new(),
+            policy: shared_access_policy(std::collections::HashSet::new(), true),
             timeout,
-            permissive: true,
         }
     }
 
-    fn is_allowed(&self, url: &str) -> bool {
-        if self.permissive {
+    pub fn with_shared_policy(policy: SharedAccessPolicy, timeout: Duration) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            policy,
+            timeout,
+        }
+    }
+
+    async fn is_allowed(&self, url: &str) -> bool {
+        let policy = self.policy.read().await;
+        if policy.permissive {
             return true;
         }
         reqwest::Url::parse(url)
             .ok()
             .and_then(|parsed: reqwest::Url| parsed.host_str().map(|h| h.to_string()))
-            .is_some_and(|host| self.allowed_hosts.contains(&host))
+            .is_some_and(|host| policy.allowlist.contains(&host))
+    }
+
+    pub async fn access_policy(&self) -> AccessPolicy {
+        self.policy.read().await.clone()
     }
 }
 
@@ -71,7 +81,7 @@ impl NativeSkill for HttpFetchSkill {
             SkillExecutionError::new(SkillFailureKind::InvalidResponse, "missing 'url' arg")
         })?;
 
-        if !self.is_allowed(url) {
+        if !self.is_allowed(url).await {
             warn!(url = %url, "http_fetch: host not on allowlist");
             return Err(SkillExecutionError::new(
                 SkillFailureKind::PermissionDenied,
@@ -177,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_allowlist_denies_by_default() {
-        let skill = HttpFetchSkill::new(HashSet::new(), Duration::from_secs(1));
+        let skill = HttpFetchSkill::new(std::collections::HashSet::new(), Duration::from_secs(1));
         let err = skill
             .execute(invocation("https://example.com"))
             .await

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use thiserror::Error;
 use tokio::task::JoinSet;
-use tracing::{error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -429,40 +429,71 @@ impl AgentEngine {
             metadata,
         } = &request.trigger
         {
-            let pending = match self
+            let mut pending = None;
+            let mut already_resolved = false;
+            let mut effective_decision = decision.clone();
+
+            if let Some(p) = self
                 .memory
                 .find_pending_approval_by_resume_token(&context.session_id, resume_token.as_str())
                 .await?
             {
-                Some(pending) => pending,
-                None => {
-                    let outcome = self
-                        .finish(
-                            &mut context,
-                            StopReason::PolicyAborted,
-                            None,
-                            Some("resume token not found".to_string()),
-                            0,
-                            None,
-                        )
-                        .await?;
-                    return Ok(build_advance_result(outcome, emitted_events));
+                pending = Some(p);
+            } else {
+                let resolution = context.records.iter().find_map(|r| match r {
+                    SessionRecord::ApprovalResolution(res)
+                        if res.resume_token.as_str() == resume_token.as_str() =>
+                    {
+                        Some(res.clone())
+                    }
+                    _ => None,
+                });
+                if let Some(res) = resolution {
+                    let original_pending = context.records.iter().find_map(|r| match r {
+                        SessionRecord::PendingApproval(p)
+                            if p.resume_token.as_str() == resume_token.as_str() =>
+                        {
+                            Some(p.clone())
+                        }
+                        _ => None,
+                    });
+                    if let Some(p) = original_pending {
+                        pending = Some(p);
+                        already_resolved = true;
+                        effective_decision = res.decision.clone();
+                    }
                 }
+            }
+
+            let Some(pending) = pending else {
+                let outcome = self
+                    .finish(
+                        &mut context,
+                        StopReason::PolicyAborted,
+                        None,
+                        Some("resume token not found".to_string()),
+                        steps_executed,
+                        None,
+                    )
+                    .await?;
+                return Ok(build_advance_result(outcome, emitted_events));
             };
 
-            self.memory
-                .append_approval_resolution(
-                    &context.session_id,
-                    ApprovalResolutionRecord {
-                        resume_token: pending.resume_token.clone(),
-                        resolved_at: SystemTime::now(),
-                        decision: decision.clone(),
-                        metadata: metadata.clone(),
-                    },
-                )
-                .await?;
+            if !already_resolved {
+                self.memory
+                    .append_approval_resolution(
+                        &context.session_id,
+                        ApprovalResolutionRecord {
+                            resume_token: pending.resume_token.clone(),
+                            resolved_at: SystemTime::now(),
+                            decision: effective_decision.clone(),
+                            metadata: metadata.clone(),
+                        },
+                    )
+                    .await?;
+            }
 
-            let resumed = match decision {
+            let resumed = match effective_decision {
                 ApprovalDecision::Approved => match self
                     .execute_planned_calls(
                         &context,
@@ -516,6 +547,27 @@ impl AgentEngine {
             if resumed.all_failed {
                 consecutive_tool_failure_steps += 1;
             }
+        } else if let AgentTrigger::DelegationResult {
+            correlation_id: _,
+            payload: _,
+            metadata: _,
+        } = &request.trigger
+        {
+            // The DelegationResult event was already appended to history via `derive_trigger_kernel_events`
+            // We just need to resume execution.
+            // Actually wait, `derive_trigger_kernel_events` returns the event, and `self.persist_kernel_events` appends it.
+            // So we don't need to do anything special here other than let the normal policy loop continue,
+            // since the LLM will see the `KernelEvent::DelegationResolved` or `AgentTrigger::DelegationResult` in its context
+            // and know the sub-task is done.
+
+            // Let's just make sure it counts as a step or something if necessary.
+            // Actually, we can just proceed to `self.perform_single_step`
+
+            // Wait, we should probably append a fake tool result or something, or the LLM can just read the Trigger.
+            // `build_provider_contents` already includes the Trigger in the context.
+
+            // So nothing extra is strictly needed here for resumption, it will fall through to `perform_single_step`
+            // which will call the LLM to get the next action.
         }
 
         self.perform_single_step(
@@ -618,12 +670,17 @@ impl AgentEngine {
                         context.prior_tool_results.push(result.clone());
                         context.records.push(SessionRecord::ToolResult(result));
                     }
-                    return Ok(AdvanceResult {
-                        outcome: None,
-                        emitted_events: Vec::new(),
-                        state_delta: AgentStateDelta::default(),
-                        wake_request: None,
-                    });
+                    // Instead of yielding to the runtime, we must perform the next step directly
+                    // to ensure the LLM sees the ToolResultRecord that we just executed!
+                    return self
+                        .perform_single_step(
+                            context,
+                            active_trigger.trigger,
+                            snapshot.current_step_count(),
+                            snapshot.current_consecutive_tool_failure_steps(),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 BatchExecution::Suspended { .. } => {
                     let outcome = self
@@ -718,10 +775,10 @@ impl AgentEngine {
             .records
             .iter()
             .filter_map(|record| {
-                if let SessionRecord::StrategyPreference(pref) = record {
-                    if let Some(skill_name) = &pref.skill_name {
-                        return Some((skill_name.clone(), pref.reason.clone()));
-                    }
+                if let SessionRecord::StrategyPreference(pref) = record
+                    && let Some(skill_name) = &pref.skill_name
+                {
+                    return Some((skill_name.clone(), pref.reason.clone()));
                 }
                 None
             })
@@ -888,6 +945,107 @@ impl AgentEngine {
                     )
                     .await?;
                 Ok(build_advance_result(outcome, emitted_events))
+            }
+            AgentAction::MemorySearch { query, limit } => {
+                let mut results = self
+                    .memory
+                    .list_records(crate::RecordPageQuery::new(context.session_id.clone()))
+                    .await
+                    .map(|p| p.records)
+                    .unwrap_or_default();
+
+                let query_lower = query.to_lowercase();
+                results.retain(|r| {
+                    format!("{:?}", r.record)
+                        .to_lowercase()
+                        .contains(&query_lower)
+                });
+                results.truncate(limit.max(1));
+
+                let observation = serde_json::to_value(results).unwrap_or_default();
+
+                let event = KernelEventRecord {
+                    event_id: Uuid::new_v4().to_string(),
+                    occurred_at: SystemTime::now(),
+                    event: KernelEvent::MemorySearched { query, limit },
+                };
+                self.memory
+                    .append_kernel_event(&context.session_id, event.clone())
+                    .await?;
+                context
+                    .records
+                    .push(SessionRecord::KernelEvent(event.clone()));
+                emitted_events.push(event.clone());
+
+                let _observation_event = KernelEventRecord {
+                    event_id: Uuid::new_v4().to_string(),
+                    occurred_at: SystemTime::now(),
+                    event: KernelEvent::ObservationAppended(crate::ObservationRecord {
+                        observation_id: crate::ObservationId(Uuid::new_v4().to_string()),
+                        recorded_at: SystemTime::now(),
+                        source: "MemorySearch".to_string(),
+                        content: observation,
+                        attachment_ids: vec![],
+                        related_resources: vec![],
+                    }),
+                };
+                self.memory
+                    .append_kernel_event(&context.session_id, _observation_event.clone())
+                    .await?;
+                context
+                    .records
+                    .push(SessionRecord::KernelEvent(_observation_event.clone()));
+                emitted_events.push(_observation_event.clone());
+
+                Ok(AdvanceResult {
+                    outcome: None,
+                    emitted_events: emitted_events.clone(),
+                    state_delta: derive_state_delta(&emitted_events),
+                    wake_request: emitted_events.iter().find_map(extract_wake_request),
+                })
+            }
+            AgentAction::MemoryArchive { content } => {
+                let event = KernelEventRecord {
+                    event_id: Uuid::new_v4().to_string(),
+                    occurred_at: SystemTime::now(),
+                    event: KernelEvent::MemoryArchived {
+                        content: content.clone(),
+                    },
+                };
+                self.memory
+                    .append_kernel_event(&context.session_id, event.clone())
+                    .await?;
+                context
+                    .records
+                    .push(SessionRecord::KernelEvent(event.clone()));
+                emitted_events.push(event.clone());
+
+                let _observation_event = KernelEventRecord {
+                    event_id: Uuid::new_v4().to_string(),
+                    occurred_at: SystemTime::now(),
+                    event: KernelEvent::ObservationAppended(crate::ObservationRecord {
+                        observation_id: crate::ObservationId(Uuid::new_v4().to_string()),
+                        recorded_at: SystemTime::now(),
+                        source: "MemoryArchive".to_string(),
+                        content: serde_json::json!({ "status": "archived successfully" }),
+                        attachment_ids: vec![],
+                        related_resources: vec![],
+                    }),
+                };
+                self.memory
+                    .append_kernel_event(&context.session_id, _observation_event.clone())
+                    .await?;
+                context
+                    .records
+                    .push(SessionRecord::KernelEvent(_observation_event.clone()));
+                emitted_events.push(_observation_event.clone());
+
+                Ok(AdvanceResult {
+                    outcome: None,
+                    emitted_events: emitted_events.clone(),
+                    state_delta: derive_state_delta(&emitted_events),
+                    wake_request: emitted_events.iter().find_map(extract_wake_request),
+                })
             }
             AgentAction::Continue { .. } => Ok(AdvanceResult {
                 outcome: None,
@@ -1954,6 +2112,8 @@ fn action_metric_label(action: &AgentAction) -> &'static str {
         AgentAction::CallSkills(_) => "call_skills",
         AgentAction::Continue { .. } => "continue",
         AgentAction::Yield { .. } => "yield",
+        AgentAction::MemorySearch { .. } => "memory_search",
+        AgentAction::MemoryArchive { .. } => "memory_archive",
         AgentAction::Suspend { .. } => "suspend",
         AgentAction::Delegate { .. } => "delegate",
     }
@@ -2562,7 +2722,9 @@ fn derive_state_delta(events: &[KernelEventRecord]) -> AgentStateDelta {
             | KernelEvent::WakeScheduled(_)
             | KernelEvent::WakeCompleted { .. }
             | KernelEvent::ResourceRegistered(_)
-            | KernelEvent::RelationshipObserved(_) => {}
+            | KernelEvent::RelationshipObserved(_)
+            | KernelEvent::MemorySearched { .. }
+            | KernelEvent::MemoryArchived { .. } => {}
         }
     }
     delta
@@ -2721,8 +2883,27 @@ fn build_provider_contents(
         }
     }
 
+    // Apply Virtual Context Window constraints
+    // Max 32 recent items (we can make this dynamic via policy later, hardcoded to 32 for now)
+    let max_recent_items = 32;
+    let (truncated_history, truncated) = if history.len() > max_recent_items {
+        (&history[history.len() - max_recent_items..], true)
+    } else {
+        (history, false)
+    };
+
+    if truncated {
+        messages.push(ProviderMessage {
+            role: ProviderRole::System,
+            parts: vec![ProviderContentPart::Text(
+                "Notice: Older session history has been paged out to Archival Memory to save space. \
+                 Use the `MemorySearch` action to retrieve specific past interactions if you need them.".to_string(),
+            )],
+        });
+    }
+
     // Map history to messages to provide multi-turn memory
-    for record in history {
+    for record in truncated_history {
         match record {
             SessionRecord::Trigger(t) => {
                 let mut parts = build_trigger_parts(&t.trigger);
@@ -3922,7 +4103,10 @@ mod tests {
             .await
             .expect("advance");
 
-        assert!(result.outcome.is_none());
+        // The engine now returns an outcome because we altered it to fall through to `perform_single_step`
+        // which makes the LLM run again, returning `Responded`.
+        assert!(result.outcome.is_some());
+        assert_eq!(result.outcome.unwrap().stop_reason, StopReason::Responded);
         assert_eq!(*c1_calls.lock().expect("lock"), 0);
         assert_eq!(*c2_calls.lock().expect("lock"), 1);
         let snapshot = session(&store, session_id).await;

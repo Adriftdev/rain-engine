@@ -225,7 +225,7 @@ impl RainEngineClient {
 
     // ── Read: Health ────────────────────────────────────────────────────
 
-    /// Check the gateway health.
+    /// Check the runtime health.
     /// Route: `GET /health`
     pub async fn health(&self) -> Result<Value, ClientError> {
         let url = self.base_url.join("health")?;

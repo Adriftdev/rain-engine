@@ -1,4 +1,4 @@
-//! Discord bot adapter using REST gateway interactions.
+//! Discord bot adapter using runtime delivery plus Discord Gateway events.
 //!
 //! Requires `DISCORD_BOT_TOKEN` to be set.
 //! This adapter uses the Discord Gateway (WebSocket) for receiving messages
@@ -21,7 +21,7 @@ pub struct DiscordAdapter {
 impl DiscordAdapter {
     pub fn new(token: String, config: ChannelConfig) -> Self {
         Self {
-            engine_client: RainEngineClient::new(&config.gateway_url)
+            engine_client: RainEngineClient::new(&config.runtime_url)
                 .expect("failed to init client"),
             client: reqwest::Client::new(),
             token,

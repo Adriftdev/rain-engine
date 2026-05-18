@@ -13,8 +13,8 @@ use async_trait::async_trait;
 /// Configuration for a channel adapter.
 #[derive(Debug, Clone)]
 pub struct ChannelConfig {
-    /// Base URL of the RainEngine gateway.
-    pub gateway_url: String,
+    /// Base URL of the RainEngine runtime HTTP surface.
+    pub runtime_url: String,
     /// Session ID to use (or derive from platform user ID).
     pub default_session_prefix: String,
 }

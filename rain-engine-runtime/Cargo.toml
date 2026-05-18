@@ -19,6 +19,7 @@ rain-engine-store-pg = { path = "../rain-engine-store-pg" }
 rain-engine-store-sqlite = { path = "../rain-engine-store-sqlite" }
 rain-engine-wasm = { path = "../rain-engine-wasm" }
 rain-engine-skills = { path = "../rain-engine-skills" }
+rain-engine-ingress = { path = "../rain-engine-ingress" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -11,6 +11,30 @@ pub mod shell_exec;
 pub mod web_reader;
 
 use rain_engine_core::{RetryPolicy, SkillManifest};
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessPolicy {
+    pub allowlist: HashSet<String>,
+    pub permissive: bool,
+}
+
+impl AccessPolicy {
+    pub fn new(allowlist: HashSet<String>, permissive: bool) -> Self {
+        Self {
+            allowlist,
+            permissive,
+        }
+    }
+}
+
+pub type SharedAccessPolicy = Arc<RwLock<AccessPolicy>>;
+
+pub fn shared_access_policy(allowlist: HashSet<String>, permissive: bool) -> SharedAccessPolicy {
+    Arc::new(RwLock::new(AccessPolicy::new(allowlist, permissive)))
+}
 
 /// Helper to build a SkillManifest with common defaults.
 fn base_manifest(name: &str, description: &str, input_schema: serde_json::Value) -> SkillManifest {

@@ -6,8 +6,11 @@
 
 use crate::{ChannelAdapter, ChannelConfig};
 use async_trait::async_trait;
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use rain_engine_client::RainEngineClient;
 use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
@@ -30,7 +33,7 @@ impl SlackAdapter {
         config: ChannelConfig,
     ) -> Self {
         Self {
-            engine_client: RainEngineClient::new(&config.gateway_url)
+            engine_client: RainEngineClient::new(&config.runtime_url)
                 .expect("failed to init client"),
             client: reqwest::Client::new(),
             bot_token,
@@ -124,22 +127,57 @@ impl ChannelAdapter for SlackAdapter {
             port = self.listen_port,
             "Slack adapter started — listening for Events API"
         );
+        warn!("Slack request signature verification is not enforced yet");
 
-        // In production this would spin up a small axum server to receive
-        // Slack Event API POSTs. For now, the structural skeleton is in place.
-        // The handle_event_message method is fully wired and ready.
-        //
-        // Integration pattern:
-        // 1. Slack sends POST to http://your-server:{port}/slack/events
-        // 2. We parse the SlackEventPayload
-        // 3. For url_verification: return { challenge }
-        // 4. For event_callback with message type: call handle_event_message
-        warn!(
-            "Slack adapter: Events API HTTP listener not yet started. Use handle_event_message() for integration."
-        );
+        let app = Router::new()
+            .route("/slack/events", post(handle_events))
+            .with_state(Arc::new(self.clone()));
 
-        // Keep alive until cancelled
-        cancel.cancelled().await;
+        let listener = match tokio::net::TcpListener::bind(("0.0.0.0", self.listen_port)).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                error!("Slack adapter failed to bind: {err}");
+                return;
+            }
+        };
+
+        if let Err(err) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { cancel.cancelled().await })
+            .await
+        {
+            error!("Slack adapter listener error: {err}");
+        }
+
         info!("Slack adapter shutting down");
+    }
+}
+
+async fn handle_events(
+    State(adapter): State<Arc<SlackAdapter>>,
+    Json(payload): Json<SlackEventPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match payload.r#type.as_str() {
+        "url_verification" => {
+            let challenge = payload.challenge.unwrap_or_default();
+            Ok(Json(json!({ "challenge": challenge })))
+        }
+        "event_callback" => {
+            if let Some(event) = payload.event {
+                let is_supported_message =
+                    event.r#type == "message" || event.r#type == "app_mention";
+                if is_supported_message
+                    && let (Some(channel), Some(user), Some(text)) = (
+                        event.channel.as_deref(),
+                        event.user.as_deref(),
+                        event.text.as_deref(),
+                    )
+                    && event.bot_id.is_none()
+                {
+                    adapter.handle_event_message(channel, user, text).await;
+                }
+            }
+            Ok(Json(json!({ "ok": true })))
+        }
+        _ => Ok(Json(json!({ "ok": true }))),
     }
 }

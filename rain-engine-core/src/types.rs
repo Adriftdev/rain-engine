@@ -381,6 +381,13 @@ pub enum KernelEvent {
     },
     ResourceRegistered(ResourceRef),
     RelationshipObserved(RelationshipEdge),
+    MemorySearched {
+        query: String,
+        limit: usize,
+    },
+    MemoryArchived {
+        content: String,
+    },
 }
 
 #[typeshare::typeshare]
@@ -660,6 +667,13 @@ pub enum AgentAction {
     },
     Yield {
         reason: Option<String>,
+    },
+    MemorySearch {
+        query: String,
+        limit: usize,
+    },
+    MemoryArchive {
+        content: String,
     },
     Suspend {
         reason: SuspendReason,
@@ -1749,6 +1763,7 @@ impl SessionSnapshot {
                     })
                 }
                 KernelEvent::RelationshipObserved(edge) => relationships.push(edge),
+                KernelEvent::MemorySearched { .. } | KernelEvent::MemoryArchived { .. } => {}
             }
         }
 

@@ -2,10 +2,8 @@
 members = [
     "rain-engine-blob",
     "rain-engine-channels",
-    "rain-engine-cli",
     "rain-engine-cognition",
     "rain-engine-core",
-    "rain-engine-gateway",
     "rain-engine-ingress",
     "rain-engine-macros",
     "rain-engine-memory",
@@ -46,7 +44,6 @@ headless_chrome = "1.0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "process", "io-util", "signal"] }
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 url = "2"
@@ -56,7 +53,6 @@ wat = "1"
 quote = "1"
 proc-macro2 = "1"
 redis = { version = "0.32.7", features = ["aio", "tokio-comp"] }
-serde_yaml = "0.9"
 typeshare = "1"
 
 [package]
@@ -65,7 +61,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "An event-sourced Rust kernel for building durable AI agent systems"
-repository = "https://github.com/peter-steinberger/rain-engine" # Example placeholder
+repository = "https://github.com/Adriftdev/rain-engine"
 
 [features]
 default = ["server", "client", "sqlite", "gemini"]

@@ -1,44 +1,50 @@
+use crate::{AccessPolicy, SharedAccessPolicy, shared_access_policy};
 use async_trait::async_trait;
 use headless_chrome::{Browser, LaunchOptions};
 use rain_engine_core::{
     NativeSkill, SkillExecutionError, SkillFailureKind, SkillInvocation, SkillManifest,
 };
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{info, warn};
 
 pub struct WebReaderSkill {
-    allowed_hosts: HashSet<String>,
+    policy: SharedAccessPolicy,
     timeout: Duration,
-    permissive: bool,
 }
 
 impl WebReaderSkill {
-    pub fn new(allowed_hosts: HashSet<String>, timeout: Duration) -> Self {
+    pub fn new(allowed_hosts: std::collections::HashSet<String>, timeout: Duration) -> Self {
         Self {
-            allowed_hosts,
+            policy: shared_access_policy(allowed_hosts, false),
             timeout,
-            permissive: false,
         }
     }
 
     pub fn permissive(timeout: Duration) -> Self {
         Self {
-            allowed_hosts: HashSet::new(),
+            policy: shared_access_policy(std::collections::HashSet::new(), true),
             timeout,
-            permissive: true,
         }
     }
 
-    fn is_allowed(&self, url: &str) -> bool {
-        if self.permissive {
+    pub fn with_shared_policy(policy: SharedAccessPolicy, timeout: Duration) -> Self {
+        Self { policy, timeout }
+    }
+
+    async fn is_allowed(&self, url: &str) -> bool {
+        let policy = self.policy.read().await;
+        if policy.permissive {
             return true;
         }
         reqwest::Url::parse(url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
-            .is_some_and(|host| self.allowed_hosts.contains(&host))
+            .is_some_and(|host| policy.allowlist.contains(&host))
+    }
+
+    pub async fn access_policy(&self) -> AccessPolicy {
+        self.policy.read().await.clone()
     }
 }
 
@@ -67,7 +73,7 @@ impl NativeSkill for WebReaderSkill {
             })?
             .to_string();
 
-        if !self.is_allowed(&url) {
+        if !self.is_allowed(&url).await {
             warn!(url = %url, "web_reader: host not on allowlist");
             return Err(SkillExecutionError::new(
                 SkillFailureKind::PermissionDenied,
@@ -173,7 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_allowlist_denies_by_default() {
-        let skill = WebReaderSkill::new(HashSet::new(), Duration::from_secs(1));
+        let skill = WebReaderSkill::new(std::collections::HashSet::new(), Duration::from_secs(1));
         let err = skill
             .execute(invocation("https://example.com"))
             .await
