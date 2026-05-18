@@ -3,6 +3,13 @@ name = "rain-engine-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Provider-neutral event kernel for RainEngine"
+documentation = "https://docs.rs/rain-engine-core"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
 async-trait.workspace = true

@@ -3,10 +3,17 @@ name = "rain-engine-ingress"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Ingress utilities for RainEngine event delivery"
+documentation = "https://docs.rs/rain-engine-ingress"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
-rain-engine-core = { path = "../rain-engine-core" }
-rain-engine-store-valkey = { path = "../rain-engine-store-valkey" }
+rain-engine-core = { path = "../rain-engine-core", version = "0.1.0" }
+rain-engine-store-valkey = { path = "../rain-engine-store-valkey", version = "0.1.0" }
 redis.workspace = true
 serde.workspace = true
 serde_json.workspace = true

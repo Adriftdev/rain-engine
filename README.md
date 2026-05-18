@@ -1,37 +1,98 @@
 # RainEngine
 
-RainEngine is a self-improving, event-sourced Rust library workspace for
-building durable AI agent systems.
+RainEngine is an event-sourced Rust library for building durable AI agent
+systems. The repository stays internally modular, but the intended public
+entrypoint is the single `rain-engine` crate.
+
+```toml
+[dependencies]
+rain-engine = { version = "0.1", features = ["memory", "blob"] }
+```
 
 The core idea is simple: an agent is a state machine backed by an append-only
 ledger. Every webhook, human message, scheduled wake, approval, delegation
-result, model decision, tool call, tool result, and terminal outcome is recorded
-as a durable event. Runtimes repeatedly call `AgentEngine::advance(...)` to move
-the state machine forward one step at a time.
+result, model decision, tool call, tool result, and terminal outcome is
+recorded as a durable event. Hosts repeatedly call `AgentEngine::advance(...)`
+to move the state machine forward one step at a time.
 
-The kernel also reflects on its own ledger. It records what happened, summarizes
-tool and provider performance, applies bounded policy overlays for future
-advances, and rolls those overlays back if they regress. Self-improvement is
-visible, auditable, and never grants new power silently.
+The kernel also reflects on its own ledger. It records what happened,
+summarizes tool and provider performance, applies bounded policy overlays for
+future advances, and rolls those overlays back if they regress. Self-improvement
+is visible, auditable, and never grants new power silently.
+
+## Feature Matrix
+
+Use the root crate and enable only the integrations you need:
+
+| Goal | Feature |
+| --- | --- |
+| Kernel types and engine | always available |
+| Retrieval helpers | `memory` |
+| Blob backends | `blob` |
+| Planning helpers | `cognition` |
+| WASM skill execution | `wasm` |
+| HTTP runtime | `runtime` |
+| HTTP client | `client` |
+| Channel adapters | `channels` |
+| Gemini provider | `provider-gemini` |
+| OpenAI-compatible provider | `provider-openai` |
+| SQLite store | `store-sqlite` |
+| Postgres store | `store-pg` |
+| Valkey coordination store | `store-valkey` |
+
+Default features stay lightweight and enable `memory` plus `blob`.
+
+## Quickstart
+
+```rust
+use rain_engine::kernel::{
+    AdvanceRequest, AgentAction, AgentEngine, AgentTrigger, InMemoryMemoryStore,
+    MockLlmProvider, ProcessRequest,
+};
+use std::sync::Arc;
+
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let memory = Arc::new(InMemoryMemoryStore::new());
+let provider = Arc::new(MockLlmProvider::scripted(vec![AgentAction::Respond {
+    content: "hello from rain-engine".to_string(),
+}]));
+
+let engine = AgentEngine::new(provider, memory);
+let request = ProcessRequest::new(
+    "quickstart-session",
+    AgentTrigger::Message {
+        user_id: "user-1".to_string(),
+        content: "Say hello".to_string(),
+        attachments: Vec::new(),
+    },
+);
+
+let advance = engine.advance(AdvanceRequest::Trigger(request)).await?;
+println!("{:?}", advance.outcome);
+# Ok(())
+# }
+```
+
+For macros such as `#[derive(SkillManifest)]`, add `rain-engine-macros`
+alongside the root crate in advanced setups.
 
 ## Workspace
 
-- `rain-engine-core`: provider-neutral event kernel, domain models, policies, traits, ledger projections, and in-memory stores
-- `rain-engine-cognition`: optional planners, task routing, review policy, wake policy, and reflection policy
-- `rain-engine-memory`: ledger-backed exact replay, recent working sets, graph lookup, and simple semantic retrieval
-- `rain-engine-runtime`: reference Axum runtime library that parses events and owns the advance loop
-- `rain-engine-client`: Rust client for runtime integrations
-- `rain-engine-ingress`: shared event envelope and Valkey Streams worker utilities
-- `rain-engine-blob`: local and in-memory blob stores for multimodal attachments
-- `rain-engine-wasm`: Wasmtime executor for untrusted skills with explicit host capabilities
-- `rain-engine-macros`: `#[derive(SkillManifest)]` for typed skill manifests
-- `rain-engine-skills`: built-in trusted native skills for local development and runtime-backed deployments
-- `rain-engine-channels`: channel adapters that translate external messages into kernel events
-- `rain-engine-provider-gemini`: Gemini REST provider with multimodal content, parallel tool calls, and cache metadata
-- `rain-engine-openai`: OpenAI-compatible baseline provider
-- `rain-engine-store-pg`: Postgres append-only ledger store
-- `rain-engine-store-sqlite`: SQLite ledger store for local development and tests
-- `rain-engine-store-valkey`: Valkey coordination claims and short-lived scratchpad storage
+The repo remains split into focused crates for maintainability:
+
+- `rain-engine-core`: provider-neutral event kernel, policies, traits, and ledger projections
+- `rain-engine-memory`: retrieval over session ledgers
+- `rain-engine-blob`: blob backends for multimodal attachments
+- `rain-engine-cognition`: optional planning and task orchestration
+- `rain-engine-wasm`: Wasmtime executor for untrusted skills
+- `rain-engine-runtime`: reference Axum runtime library
+- `rain-engine-client`: runtime HTTP client
+- `rain-engine-provider-gemini`: Gemini provider
+- `rain-engine-openai`: OpenAI-compatible provider
+- `rain-engine-store-sqlite`, `rain-engine-store-pg`, `rain-engine-store-valkey`: store integrations
+- `rain-engine-channels`, `rain-engine-ingress`, `rain-engine-skills`: supporting integration crates
+- `rain-engine-macros`: typed manifest proc macros
 
 ## Architecture
 
@@ -100,10 +161,10 @@ Guardrails are explicit:
 ## Library Surface
 
 RainEngine intentionally stops at reusable libraries. There are no first-party
-CLI, standalone daemon binary, or browser UI surfaces in this repository. The runtime,
-client, ingress, store, and provider crates are intended to be embedded in
-other systems that provide their own process model, configuration UX, and
-operator tooling.
+CLI, standalone daemon binary, or browser UI surfaces in this repository. The
+runtime, client, ingress, store, and provider crates are intended to be
+embedded in other systems that provide their own process model, configuration
+UX, and operator tooling.
 
 ## State Model
 
@@ -121,8 +182,10 @@ must be rebuildable from stored records.
 
 ## Examples
 
-- Embedded SQLite flow: [embedded_sqlite.rs](/Users/adrift/projects/rain-engine/rain-engine-runtime/examples/embedded_sqlite.rs)
-- Runtime bootstrap config: [runtime_postgres.rs](/Users/adrift/projects/rain-engine/rain-engine-runtime/examples/runtime_postgres.rs)
+- In-memory kernel: [examples/in_memory_kernel.rs](/Users/adrift/projects/rain-engine/examples/in_memory_kernel.rs)
+- SQLite-backed embedding: [examples/sqlite_embedding.rs](/Users/adrift/projects/rain-engine/examples/sqlite_embedding.rs)
+- Gemini provider setup: [examples/provider_gemini.rs](/Users/adrift/projects/rain-engine/examples/provider_gemini.rs)
+- OpenAI-compatible provider setup: [examples/provider_openai.rs](/Users/adrift/projects/rain-engine/examples/provider_openai.rs)
 
 ## Verification
 
@@ -130,4 +193,5 @@ must be rebuildable from stored records.
 cargo fmt
 cargo clippy --workspace --all-targets
 cargo test --workspace --all-targets --quiet
+cargo package --allow-dirty
 ```

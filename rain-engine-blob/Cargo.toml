@@ -3,10 +3,17 @@ name = "rain-engine-blob"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Blob storage backends for RainEngine attachments"
+documentation = "https://docs.rs/rain-engine-blob"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
 async-trait.workspace = true
-rain-engine-core = { path = "../rain-engine-core" }
+rain-engine-core = { path = "../rain-engine-core", version = "0.1.0" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

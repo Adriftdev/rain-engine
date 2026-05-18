@@ -3,10 +3,17 @@ name = "rain-engine-memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Retrieval utilities for RainEngine session ledgers"
+documentation = "https://docs.rs/rain-engine-memory"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
 async-trait.workspace = true
-rain-engine-core = { path = "../rain-engine-core" }
+rain-engine-core = { path = "../rain-engine-core", version = "0.1.0" }
 serde_json.workspace = true
 
 [dev-dependencies]

@@ -3,6 +3,13 @@ name = "rain-engine-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Reference runtime library for embedding RainEngine over HTTP"
+documentation = "https://docs.rs/rain-engine-runtime"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
 async-stream = { workspace = true }
@@ -10,16 +17,16 @@ async-trait.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 multer.workspace = true
-rain-engine-blob = { path = "../rain-engine-blob" }
-rain-engine-core = { path = "../rain-engine-core" }
-rain-engine-provider-gemini = { path = "../rain-engine-provider-gemini" }
-rain-engine-openai = { path = "../rain-engine-openai" }
-rain-engine-cognition = { path = "../rain-engine-cognition" }
-rain-engine-store-pg = { path = "../rain-engine-store-pg" }
-rain-engine-store-sqlite = { path = "../rain-engine-store-sqlite" }
-rain-engine-wasm = { path = "../rain-engine-wasm" }
-rain-engine-skills = { path = "../rain-engine-skills" }
-rain-engine-ingress = { path = "../rain-engine-ingress" }
+rain-engine-blob = { path = "../rain-engine-blob", version = "0.1.0" }
+rain-engine-core = { path = "../rain-engine-core", version = "0.1.0" }
+rain-engine-provider-gemini = { path = "../rain-engine-provider-gemini", version = "0.1.0" }
+rain-engine-openai = { path = "../rain-engine-openai", version = "0.1.0" }
+rain-engine-cognition = { path = "../rain-engine-cognition", version = "0.1.0" }
+rain-engine-store-pg = { path = "../rain-engine-store-pg", version = "0.1.0" }
+rain-engine-store-sqlite = { path = "../rain-engine-store-sqlite", version = "0.1.0" }
+rain-engine-wasm = { path = "../rain-engine-wasm", version = "0.1.0" }
+rain-engine-skills = { path = "../rain-engine-skills", version = "0.1.0" }
+rain-engine-ingress = { path = "../rain-engine-ingress", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -33,6 +40,6 @@ reqwest = { workspace = true, features = ["json"] }
 base64.workspace = true
 
 [dev-dependencies]
-rain-engine-macros = { path = "../rain-engine-macros" }
+rain-engine-macros = { path = "../rain-engine-macros", version = "0.1.0" }
 schemars.workspace = true
 tower.workspace = true

@@ -1,5 +1,7 @@
+#![cfg(all(feature = "runtime", feature = "client"))]
+
+use rain_engine::runtime::{EventIngressRequest, WebhookIngressRequest};
 use rain_engine::{Client, ServerBuilder};
-use rain_engine_runtime::{EventIngressRequest, WebhookIngressRequest};
 use serde_json::json;
 use std::collections::BTreeSet;
 use tokio::net::TcpListener;

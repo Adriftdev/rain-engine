@@ -3,14 +3,21 @@ name = "rain-engine-store-sqlite"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SQLite ledger store for RainEngine"
+documentation = "https://docs.rs/rain-engine-store-sqlite"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "database"]
 
 [dependencies]
 async-trait.workspace = true
-rain-engine-core = { path = "../rain-engine-core" }
+rain-engine-core = { path = "../rain-engine-core", version = "0.1.0" }
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-rain-engine-openai = { path = "../rain-engine-openai" }
+rain-engine-openai = { path = "../rain-engine-openai", version = "0.1.0" }

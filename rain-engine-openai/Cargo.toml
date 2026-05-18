@@ -3,10 +3,17 @@ name = "rain-engine-openai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "OpenAI-compatible provider for RainEngine"
+documentation = "https://docs.rs/rain-engine-openai"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
 async-trait.workspace = true
-rain-engine-core = { path = "../rain-engine-core" }
+rain-engine-core = { path = "../rain-engine-core", version = "0.1.0" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1972,7 +1972,9 @@ name = "rain-engine"
 version = "0.1.0"
 dependencies = [
  "rain-engine-blob",
+ "rain-engine-channels",
  "rain-engine-client",
+ "rain-engine-cognition",
  "rain-engine-core",
  "rain-engine-memory",
  "rain-engine-openai",
@@ -1981,6 +1983,7 @@ dependencies = [
  "rain-engine-store-pg",
  "rain-engine-store-sqlite",
  "rain-engine-store-valkey",
+ "rain-engine-wasm",
  "serde_json",
  "tokio",
 ]

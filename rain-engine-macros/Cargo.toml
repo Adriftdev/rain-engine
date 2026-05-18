@@ -3,6 +3,13 @@ name = "rain-engine-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Proc macros for RainEngine manifests"
+documentation = "https://docs.rs/rain-engine-macros"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["development-tools", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

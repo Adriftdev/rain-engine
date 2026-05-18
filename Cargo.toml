@@ -23,6 +23,8 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 version = "0.1.0"
+repository = "https://github.com/Adriftdev/rain-engine"
+homepage = "https://github.com/Adriftdev/rain-engine"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -62,31 +64,59 @@ edition.workspace = true
 license.workspace = true
 description = "An event-sourced Rust kernel for building durable AI agent systems"
 repository = "https://github.com/Adriftdev/rain-engine"
+homepage.workspace = true
+documentation = "https://docs.rs/rain-engine"
+readme = "README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [features]
-default = ["server", "client", "sqlite", "gemini"]
+default = ["memory", "blob"]
 
-server = ["dep:rain-engine-runtime"]
+memory = ["dep:rain-engine-memory"]
+blob = ["dep:rain-engine-blob"]
+cognition = ["dep:rain-engine-cognition"]
+wasm = ["dep:rain-engine-wasm"]
+runtime = ["dep:rain-engine-runtime", "blob"]
 client = ["dep:rain-engine-client"]
-gemini = ["dep:rain-engine-provider-gemini"]
-openai = ["dep:rain-engine-openai"]
-sqlite = ["dep:rain-engine-store-sqlite"]
-postgres = ["dep:rain-engine-store-pg"]
-valkey = ["dep:rain-engine-store-valkey"]
+channels = ["dep:rain-engine-channels", "client"]
+provider-gemini = ["dep:rain-engine-provider-gemini"]
+provider-openai = ["dep:rain-engine-openai"]
+store-sqlite = ["dep:rain-engine-store-sqlite"]
+store-pg = ["dep:rain-engine-store-pg"]
+store-valkey = ["dep:rain-engine-store-valkey"]
 
 [dependencies]
-rain-engine-core = { path = "rain-engine-core" }
-rain-engine-blob = { path = "rain-engine-blob" }
-rain-engine-memory = { path = "rain-engine-memory" }
-rain-engine-client = { path = "rain-engine-client", optional = true }
-rain-engine-runtime = { path = "rain-engine-runtime", optional = true }
-rain-engine-store-sqlite = { path = "rain-engine-store-sqlite", optional = true }
-rain-engine-store-pg = { path = "rain-engine-store-pg", optional = true }
-rain-engine-store-valkey = { path = "rain-engine-store-valkey", optional = true }
-rain-engine-provider-gemini = { path = "rain-engine-provider-gemini", optional = true }
-rain-engine-openai = { path = "rain-engine-openai", optional = true }
+rain-engine-core = { path = "rain-engine-core", version = "0.1.0" }
+rain-engine-blob = { path = "rain-engine-blob", version = "0.1.0", optional = true }
+rain-engine-memory = { path = "rain-engine-memory", version = "0.1.0", optional = true }
+rain-engine-cognition = { path = "rain-engine-cognition", version = "0.1.0", optional = true }
+rain-engine-wasm = { path = "rain-engine-wasm", version = "0.1.0", optional = true }
+rain-engine-client = { path = "rain-engine-client", version = "0.1.0", optional = true }
+rain-engine-channels = { path = "rain-engine-channels", version = "0.1.0", optional = true }
+rain-engine-runtime = { path = "rain-engine-runtime", version = "0.1.0", optional = true }
+rain-engine-store-sqlite = { path = "rain-engine-store-sqlite", version = "0.1.0", optional = true }
+rain-engine-store-pg = { path = "rain-engine-store-pg", version = "0.1.0", optional = true }
+rain-engine-store-valkey = { path = "rain-engine-store-valkey", version = "0.1.0", optional = true }
+rain-engine-provider-gemini = { path = "rain-engine-provider-gemini", version = "0.1.0", optional = true }
+rain-engine-openai = { path = "rain-engine-openai", version = "0.1.0", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
-rain-engine-runtime = { path = "rain-engine-runtime" }
+rain-engine-runtime = { path = "rain-engine-runtime", version = "0.1.0" }
+
+[[example]]
+name = "in_memory_kernel"
+
+[[example]]
+name = "sqlite_embedding"
+required-features = ["runtime", "store-sqlite"]
+
+[[example]]
+name = "provider_gemini"
+required-features = ["provider-gemini"]
+
+[[example]]
+name = "provider_openai"
+required-features = ["provider-openai"]

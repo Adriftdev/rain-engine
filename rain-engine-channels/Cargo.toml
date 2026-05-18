@@ -3,11 +3,18 @@ name = "rain-engine-channels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Channel adapters for RainEngine runtime integrations"
+documentation = "https://docs.rs/rain-engine-channels"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
-rain-engine-client = { path = "../rain-engine-client" }
+rain-engine-client = { path = "../rain-engine-client", version = "0.1.0" }
 reqwest = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

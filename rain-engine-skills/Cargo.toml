@@ -3,12 +3,19 @@ name = "rain-engine-skills"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Built-in trusted skills for RainEngine runtimes"
+documentation = "https://docs.rs/rain-engine-skills"
+readme = "../README.md"
+keywords = ["agents", "llm", "automation", "event-sourcing", "ai"]
+categories = ["asynchronous", "development-tools"]
 
 [dependencies]
 async-trait.workspace = true
 headless_chrome = { workspace = true }
-rain-engine-core = { path = "../rain-engine-core" }
-rain-engine-memory = { path = "../rain-engine-memory" }
+rain-engine-core = { path = "../rain-engine-core", version = "0.1.0" }
+rain-engine-memory = { path = "../rain-engine-memory", version = "0.1.0" }
 reqwest = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
